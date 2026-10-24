@@ -1,0 +1,9 @@
+__pycache__/
+.venv/
+videos/*
+!videos/.gitkeep
+*.egg-info/
+build/
+dist/
+target/
+.DS_Store

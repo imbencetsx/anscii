@@ -1,0 +1,2 @@
+# Optional terminal emulator for the PTY integration test; not a runtime dependency.
+pyte==0.8.2

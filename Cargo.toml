@@ -1,0 +1,19 @@
+[package]
+name = "anscii"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Fast truecolor ASCII video player for the terminal"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+cpal = "0.18.2"
+crossterm = "0.29"
+ringbuf = "0.5.3"
+serde_json = "1.0"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
