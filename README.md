@@ -92,9 +92,14 @@ anscii videos --style whitespace
 anscii videos --style edges --threshold 64 --invert
 ```
 
-Styles share a 2×4 sample grid per terminal cell and reusable scratch buffers.
-Changing styles does not restart FFmpeg or move the playhead. Paused style changes
-are rendered once, then terminal output returns to zero.
+Each style decodes only the samples it can display: one per cell for ASCII,
+whitespace, edges, and dither; two vertical samples for blocks; and 2×4 for Braille.
+FFmpeg performs the source averaging directly, avoiding an unnecessary 8× RGB
+transfer and extra CPU averaging for full-cell styles. No terminal cells are lost.
+
+Style changes show a cached preview immediately. When the sample layout changes,
+the video decoder refines that preview in the background at the same media time;
+audio keeps running. Paused previews settle back to zero terminal output.
 
 Color mode preserves each sampled pixel's full 24-bit RGB value. Use a truecolor
 terminal for accurate colors. ASCII shapes, font, cell resolution, and terminal
@@ -126,6 +131,31 @@ Styles sample only the data they need. The compact average/luminance cache uses
 has a bounded half-second PCM ring buffer, with no allocations or locks in its
 real-time callback. Pausing suspends native audio callbacks where supported.
 
+### Large terminals / small fonts
+
+Smaller fonts automatically use the extra rows and columns. There is no hidden
+resolution cap or automatic reduction to 256 colors. Braille gives eight dot
+positions per cell; blocks give two independently colored vertical pixels.
+
+Terminal encoding and output run on a separate presenter thread. At most one
+screen is in flight: if the terminal is busy, the app waits to compose the latest
+frame instead of queuing obsolete screens. Keyboard/mouse and the audio clock
+continue running during output backpressure. On macOS/Linux, terminal writes can
+be interrupted on quit, including when the terminal stops reading. Grid storage
+is reused, and mouse-motion reports no longer rebuild a large video image.
+
+```sh
+anscii videos --style braille
+anscii videos --style blocks
+anscii --benchmark --benchmark-size 640x192
+anscii --benchmark --benchmark-size 960x288
+```
+
+The benchmark dimensions are terminal columns and rows, not source video pixels.
+Actual speed still depends on terminal painting and output throughput; a worst-case
+640×192 truecolor screen can require over 2 MB per update. `--fps 20` is an option
+for especially slow terminals without reducing spatial detail.
+
 Use a release build for playback. Increasing terminal dimensions increases the
 number of ASCII cells and terminal bandwidth; `--fps 24` is the default. Highly
 detailed full-motion truecolor footage can still be limited by the terminal's
@@ -147,6 +177,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
+python3 tests/large_terminal.py -v
 
 # Optional PTY test using a terminal emulator (Python is a test tool only)
 uv run --no-project --with pyte==0.8.2 python tests/terminal_smoke.py -v
@@ -159,3 +190,10 @@ and background colors, and verifies that returning to ASCII clears pixel backgro
 The native-audio test checks device-clock playback, pause, mute, volume controls,
 seeking, EOF/replay, and cleanup of both decoder processes. Unit tests verify
 sample gain, output-latency accounting, underruns, and exact PCM seek trimming.
+The large-grid tests cover 640×192 → 960×288 resizing, audio, native sampling
+transitions, zero traffic while paused, and quitting with an entirely blocked
+terminal. Reproduce controlled-throughput measurements with:
+
+```sh
+python3 scripts/benchmark_terminal.py --video path/to/clip.mp4 --size 960x288 --mibps 4
+```

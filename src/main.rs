@@ -1,5 +1,6 @@
 mod audio;
 mod media;
+mod presenter;
 mod render;
 mod technique;
 #[cfg(test)]
@@ -17,6 +18,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use media::{Decoder, Frame, Metadata, Probe, fit};
+use presenter::Presenter;
 use render::{GREEN, Grid, Ink, MUTED, Renderer};
 use std::{
     fs,
@@ -26,7 +28,7 @@ use std::{
     sync::mpsc::TryRecvError,
     time::{Duration, Instant},
 };
-use technique::{Painter, Settings, Style};
+use technique::{Painter, Sampling, Settings, Style};
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum Mode {
@@ -98,6 +100,9 @@ struct Args {
     /// Measure renderer CPU time and terminal output without opening the TUI
     #[arg(long)]
     benchmark: bool,
+    /// Terminal grid for benchmarks, e.g. 640x192
+    #[arg(long, default_value = "160x48", value_parser = parse_benchmark_size)]
+    benchmark_size: (u16, u16),
 }
 
 fn discover(folder: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
@@ -208,6 +213,10 @@ struct App {
     layout: Layout,
     resize_at: Option<Instant>,
     image_size: (u16, u16),
+    decoder_size: (u16, u16),
+    image_sampling: Sampling,
+    decoder_sampling: Sampling,
+    refreshing: bool,
     style: Style,
     threshold: u8,
     invert: bool,
@@ -256,6 +265,10 @@ impl App {
             layout: Layout::new(size.0, size.1),
             resize_at: None,
             image_size: (0, 0),
+            decoder_size: (0, 0),
+            image_sampling: Sampling::Braille,
+            decoder_sampling: args.style.sampling(),
+            refreshing: false,
             style: args.style,
             threshold: args.threshold,
             invert: args.invert,
@@ -332,18 +345,41 @@ impl App {
         self.clock = None;
         self.ended = false;
         let size = self.layout.video_size(self.metadata.ratio);
+        self.decoder_sampling = self.style.sampling();
         self.decoder = Some(Decoder::start(
             path,
-            (size.0 * 2, size.1 * 4),
+            self.decoder_sampling.pixels(size),
             self.fps,
             self.position,
         )?);
-        self.image_size = size;
+        self.decoder_size = size;
+        self.refreshing = false;
         self.message.clear();
         Ok(())
     }
 
+    fn reconfigure_video(&mut self, position: f64) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        self.decoder = None;
+        self.pending = None;
+        self.decoder_size = self.layout.video_size(self.metadata.ratio);
+        self.decoder_sampling = self.style.sampling();
+        self.decoder = Some(Decoder::start(
+            path,
+            self.decoder_sampling.pixels(self.decoder_size),
+            self.fps,
+            clamp_seek(position, self.metadata.duration, self.fps),
+        )?);
+        self.refreshing = true;
+        Ok(())
+    }
+
     fn accept(&mut self, frame: Frame) {
+        self.image_size = self.decoder_size;
+        self.image_sampling = self.decoder_sampling;
+        self.refreshing = false;
         self.position = frame.position;
         if let Some(old) = self.image.replace(frame)
             && let Some(decoder) = &self.decoder
@@ -381,14 +417,15 @@ impl App {
         }
         if self.resize_at.is_some_and(|deadline| now >= deadline) {
             self.resize_at = None;
-            if self.path.is_some() && self.layout.video_size(self.metadata.ratio) != self.image_size
+            if self.path.is_some()
+                && self.layout.video_size(self.metadata.ratio) != self.decoder_size
             {
                 let position = self
                     .audio
                     .as_ref()
                     .filter(|_| !self.paused)
                     .map_or(self.position, Audio::position);
-                self.restart_video(position)?;
+                self.reconfigure_video(position)?;
                 dirty = true;
             }
         }
@@ -406,10 +443,13 @@ impl App {
                 dirty = true;
             }
         }
-        if self.decoder.is_none() || self.ended || (self.paused && self.image.is_some()) {
+        if self.decoder.is_none()
+            || (self.ended && !self.refreshing)
+            || (self.paused && self.image.is_some() && !self.refreshing)
+        {
             return Ok(dirty);
         }
-        if self.clock.is_none() {
+        if self.clock.is_none() || (self.refreshing && self.paused) {
             match self.decoder.as_ref().unwrap().receive() {
                 Ok(frame) => {
                     self.clock = Some((now, frame.position));
@@ -464,7 +504,9 @@ impl App {
 
     fn wake_after(&self, now: Instant) -> Duration {
         let mut wait = Duration::from_millis(250);
-        if self.probe.is_some() || (self.decoder.is_some() && self.image.is_none()) {
+        if self.probe.is_some()
+            || (self.decoder.is_some() && (self.image.is_none() || self.refreshing))
+        {
             wait = Duration::from_millis(8);
         } else if self.decoder.is_some() && !self.paused {
             let target = self
@@ -492,6 +534,7 @@ impl App {
     }
 
     fn event(&mut self, event: Event) -> io::Result<bool> {
+        let old_style = self.style;
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                 KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Ok(false),
@@ -571,6 +614,17 @@ impl App {
                 self.resize_at = Some(Instant::now() + Duration::from_millis(120));
             }
             _ => {}
+        }
+        if old_style != self.style
+            && self.path.is_some()
+            && self.style.sampling() != self.decoder_sampling
+        {
+            let position = self
+                .audio
+                .as_ref()
+                .filter(|_| !self.paused)
+                .map_or(self.position, Audio::position);
+            self.reconfigure_video(position)?;
         }
         Ok(true)
     }
@@ -686,6 +740,7 @@ impl App {
             let (columns, rows) = self.image_size;
             let x0 = layout.left() + width.saturating_sub(layout.left() + columns + 2) / 2;
             let y0 = 4 + height.saturating_sub(7 + rows) / 2;
+            self.painter.sampling = self.image_sampling;
             self.painter.paint(
                 grid,
                 &image.pixels,
@@ -808,14 +863,16 @@ impl Terminal {
 
 fn restore_terminal() {
     let _ = terminal::disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
+    let mut commands = vec![0x18]; // cancel a partially delivered CSI before cleanup
+    let _ = crossterm::queue!(
+        commands,
         crossterm::terminal::EndSynchronizedUpdate,
         crossterm::style::ResetColor,
         Show,
         DisableMouseCapture,
         LeaveAlternateScreen
     );
+    presenter::restore(&commands);
 }
 
 impl Drop for Terminal {
@@ -827,17 +884,18 @@ impl Drop for Terminal {
 fn run(args: Args) -> io::Result<()> {
     let _terminal = Terminal::enter()?;
     let mut app = App::new(args, terminal::size()?)?;
-    let mut grid = Grid::new(app.layout.width, app.layout.height);
-    let mut renderer = Renderer::new();
-    let mut output = io::stdout().lock();
+    let presenter = Presenter::new()?;
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(app.fps));
     let mut next_present = Instant::now();
     let mut dirty = true;
     loop {
         // No busy loop: idle/paused screens block until a key/mouse/resize event.
         let wait = app.wake_after(Instant::now());
-        let wait = if dirty {
+        let ready = presenter.ready();
+        let wait = if dirty && ready {
             wait.min(next_present.saturating_duration_since(Instant::now()))
+        } else if dirty {
+            wait.min(Duration::from_millis(8))
         } else {
             wait
         };
@@ -845,6 +903,20 @@ fn run(args: Args) -> io::Result<()> {
             // Bound event batches, too: holding a key must not starve playback.
             for _ in 0..32 {
                 let event = event::read()?;
+                // Mouse motion/focus/release reports cannot change this UI.
+                // Rebuilding a huge image for each report wastes entire frames.
+                let actionable = match &event {
+                    Event::Key(key) => key.kind != KeyEventKind::Release,
+                    Event::Mouse(mouse) => mouse.kind == MouseEventKind::Down(MouseButton::Left),
+                    Event::Resize(..) => true,
+                    _ => false,
+                };
+                if !actionable {
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                    continue;
+                }
                 let result = app.event(event);
                 match result {
                     Ok(false) => return Ok(()),
@@ -867,33 +939,44 @@ fn run(args: Args) -> io::Result<()> {
             }
         }
         let now = Instant::now();
-        if dirty && now >= next_present {
-            if (grid.width, grid.height) != (app.layout.width, app.layout.height) {
-                grid = Grid::new(app.layout.width, app.layout.height);
-            }
+        if dirty
+            && now >= next_present
+            && let Some(mut grid) = presenter.grid(app.layout.width, app.layout.height)?
+        {
             app.draw(&mut grid);
-            renderer.present(&grid, &mut output)?;
+            presenter.submit(grid);
             dirty = false;
-            next_present = now + frame_interval;
+            next_present = (next_present + frame_interval).max(now);
         }
     }
 }
 
-fn benchmark() {
+fn parse_benchmark_size(value: &str) -> Result<(u16, u16), String> {
+    let (w, h) = value.split_once('x').ok_or("Expected COLUMNSxROWS")?;
+    let width = w.parse::<u16>().map_err(|e| e.to_string())?;
+    let height = h.parse::<u16>().map_err(|e| e.to_string())?;
+    if !(4..=4096).contains(&width) || !(8..=2048).contains(&height) {
+        return Err("Benchmark size must be 4x8 through 4096x2048".into());
+    }
+    Ok((width, height))
+}
+
+fn benchmark(width: u16, height: u16) {
     let mut renderer = Renderer::new();
-    let mut grid = Grid::new(160, 48);
-    for y in 0..48 {
-        for x in 0..159 {
+    let mut grid = Grid::new(width, height);
+    for y in 0..height {
+        for x in 0..width - 1 {
             grid.put(
                 x,
                 y,
                 '@',
-                Ink::Rgb([(x % 256) as u8, (y * 5) as u8, 231]),
+                Ink::Rgb([(x % 256) as u8, ((y * 5) % 256) as u8, 231]),
                 Ink::Default,
             );
         }
     }
     renderer.encode(&grid);
+    let frames = (4_600_000 / (u32::from(width) * u32::from(height))).clamp(12, 600) as u16;
     for (label, moving) in [
         ("static", false),
         ("sparse motion (10% cells)", true),
@@ -901,10 +984,10 @@ fn benchmark() {
     ] {
         let start = Instant::now();
         let mut bytes = 0;
-        for frame in 0..600_u16 {
+        for frame in 0..frames {
             if moving {
-                for y in 0..48 {
-                    for x in 0..159 {
+                for y in 0..height {
+                    for x in 0..width - 1 {
                         if label == "full motion" || x % 10 == frame % 10 {
                             grid.put(
                                 x,
@@ -924,31 +1007,35 @@ fn benchmark() {
             bytes += std::hint::black_box(renderer.encode(&grid)).len();
         }
         println!(
-            "{label}: {:.3} ms/frame, {} bytes/frame (160x48, 600 frames)",
-            start.elapsed().as_secs_f64() * 1000.0 / 600.0,
-            bytes / 600
+            "{label}: {:.3} ms/frame, {} bytes/frame ({width}x{height}, {frames} frames)",
+            start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames),
+            bytes / usize::from(frames)
         );
     }
 }
 
-fn benchmark_techniques() {
+fn benchmark_techniques(width: u16, height: u16) {
     let mut renderer = Renderer::new();
-    let mut grid = Grid::new(160, 48);
-    let size = (159, 45);
-    let mut pixels: Vec<u8> = (0..usize::from(size.0) * usize::from(size.1) * 8)
-        .flat_map(|i| {
-            [
-                (i % 256) as u8,
-                ((i / 318) % 256) as u8,
-                ((i * 7) % 256) as u8,
-            ]
-        })
-        .collect();
+    let mut grid = Grid::new(width, height);
+    let size = (width - 1, height - 3);
+    let frames = (4_000_000 / (usize::from(size.0) * usize::from(size.1))).clamp(12, 120);
     let mut painter = Painter::default();
     for style in Style::ALL {
+        let (sx, sy) = style.sampling().factors();
+        painter.sampling = style.sampling();
+        let mut pixels: Vec<u8> = (0..usize::from(size.0) * usize::from(size.1) * sx * sy)
+            .flat_map(|i| {
+                [
+                    (i % 256) as u8,
+                    ((i / (usize::from(size.0) * sx)) % 256) as u8,
+                    ((i * 7) % 256) as u8,
+                ]
+            })
+            .collect();
         let start = Instant::now();
-        for frame in 0..120 {
-            pixels[frame] = pixels[frame].wrapping_add(1);
+        for frame in 0..frames {
+            let at = frame % pixels.len();
+            pixels[at] = pixels[at].wrapping_add(1);
             painter.paint(
                 &mut grid,
                 std::hint::black_box(&pixels),
@@ -965,9 +1052,11 @@ fn benchmark_techniques() {
             std::hint::black_box(renderer.encode(&grid));
         }
         println!(
-            "{} technique + diff: {:.3} ms/frame (159x45 cells, 2x4 samples, 120 frames)",
+            "{} technique + diff: {:.3} ms/frame ({}x{} cells, {sx}x{sy} samples, {frames} frames)",
             style.label(),
-            start.elapsed().as_secs_f64() * 1000.0 / 120.0
+            start.elapsed().as_secs_f64() * 1000.0 / frames as f64,
+            size.0,
+            size.1,
         );
     }
 }
@@ -975,8 +1064,8 @@ fn benchmark_techniques() {
 fn main() {
     let args = Args::parse();
     if args.benchmark {
-        benchmark();
-        benchmark_techniques();
+        benchmark(args.benchmark_size.0, args.benchmark_size.1);
+        benchmark_techniques(args.benchmark_size.0, args.benchmark_size.1);
         return;
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -1031,6 +1120,26 @@ mod tests {
         let paused_position = app.position;
         app.tick(Instant::now() + Duration::from_secs(1)).unwrap();
         assert_eq!(app.position, paused_position);
+        for digit in ['4', '3', '1'] {
+            app.event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(digit),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.image.is_some()); // cached preview survives reconfiguration
+            while app.refreshing && Instant::now() < deadline {
+                app.tick(Instant::now()).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!app.refreshing);
+            assert_eq!(app.position, paused_position);
+            assert_eq!(app.image_sampling, app.style.sampling());
+            let (sx, sy) = app.image_sampling.factors();
+            assert_eq!(
+                app.image.as_ref().unwrap().pixels.len(),
+                usize::from(app.image_size.0) * usize::from(app.image_size.1) * sx * sy * 3
+            );
+        }
         app.restart(1.0).unwrap();
         assert!(app.paused);
         while app.image.is_none() && Instant::now() < deadline {
@@ -1048,6 +1157,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(app.position >= 1.65, "did not catch up: {}", app.position);
+        assert_eq!(
+            app.image.as_ref().unwrap().pixels.len(),
+            usize::from(app.image_size.0) * usize::from(app.image_size.1) * 3
+        );
     }
 
     #[test]

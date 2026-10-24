@@ -87,3 +87,52 @@ video to drift ahead. Device initialization and PCM decoding run off the UI thre
 Paused playback keeps producing zero terminal output, and suspends the native
 audio stream where supported. Resize and rendering-style changes preserve the
 audio stream; seeking rebuilds both streams at the same media offset.
+
+## High-resolution terminals, 25 October 2026
+
+The large-grid benchmark is now selectable with `--benchmark-size COLUMNSxROWS`.
+At 640×192, the original encoder generated about 2,343,780 bytes for a worst-case
+fully changing RGB frame, taking about 1.8 ms to encode. CPU-only timings hid the
+larger cost of sending and painting that much terminal data.
+
+Two changes address the large-grid path:
+
+- Decode only each style's actual sample layout. ASCII/whitespace/edges/dither
+  use 1×1, blocks 1×2, and Braille 2×4. All use the full terminal cell grid and
+  full sampled RGB precision. Full-cell styles transfer **8× less raw RGB**;
+  blocks transfer 4× less. Source averaging now happens once in FFmpeg's scaler.
+- Encode and write on a separate, cancellable presenter thread. One screen can
+  be in flight, with no pending backlog. The UI composes the latest media frame
+  when the sink is ready, and reuses that screen's buffer. Input and audio keep
+  running while output is blocked. macOS/Linux writes use nonblocking descriptors
+  with an OS readiness wait; descriptor mode and terminal raw mode are restored.
+
+Decoder buffers are validated when recycled across a sampling/resize transition.
+Cached previews can be rendered in any style while the new sample layout loads.
+Mouse motion and key-release reports no longer cause unnecessary image rebuilds.
+
+A real 1080p local scene was played at the same **960×288 terminal cell grid**, with
+a PTY reader capped at **4 MiB/s**. Results are medians of three runs, each with
+three seconds measured playback and audio disabled for a comparable pipeline:
+
+- Complete screen updates: **10.67 → 19.00 per second** (about 78% more).
+- Terminal traffic: **3,638 → 2,344 KiB/s** (about 36% less).
+- Combined player/decoder CPU over the entire harness run: **1.941 → 1.397 s**
+  (about 28% less).
+- Visible pause response: **44 → 13 ms**.
+- Quit: 11 ms in both cases. Both produced zero bytes while paused.
+
+A separate single-run Braille check at the same grid and read limit delivered
+13.00 → 16.33 complete updates/s, retaining all eight dot samples per cell.
+This is a controlled PTY delivery benchmark, not a GPU terminal painting benchmark;
+other footage, terminals, font sizes, and read rates can change the results.
+
+Reproduction: `scripts/benchmark_terminal.py --binary PATH --video CLIP --size
+960x288 --mibps 4` (optionally `--style braille`). The harness checks raw-mode
+restoration, pause traffic, response time, CPU usage, and completed synchronized
+updates. No video fixture is included in version control.
+
+Regression tests additionally stop reading terminal output entirely and verify
+that a large-grid player can still quit promptly and restore raw mode. Native
+audio, seeking, and style changes are exercised during 640×192 → 960×288 resizing.
+There is no default spatial downsampling cap or color approximation in this change.

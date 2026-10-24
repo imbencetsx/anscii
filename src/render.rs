@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
 pub const RAMP: &[u8] = b" .,:;irsXA253hMHGS#9B&@";
@@ -137,15 +136,6 @@ impl Renderer {
             self.output.extend_from_slice(b"\x1b[0m\x1b[?2026l");
         }
         &self.output
-    }
-
-    pub fn present(&mut self, grid: &Grid, output: &mut impl Write) -> io::Result<()> {
-        let bytes = self.encode(grid);
-        if !bytes.is_empty() {
-            output.write_all(bytes)?;
-            output.flush()?;
-        }
-        Ok(())
     }
 }
 

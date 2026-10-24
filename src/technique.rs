@@ -1,5 +1,5 @@
-//! Image techniques share 2x4 samples per cell, so changing styles never seeks
-//! or restarts FFmpeg. Scratch storage is reused across frames.
+//! Techniques decode only the samples they can display. Switching styles can
+//! preview the previous sampling immediately while a new decoder warms up.
 use crate::{
     Depth, Mode,
     render::{Cell, Grid, Ink, RAMP},
@@ -37,6 +37,38 @@ impl Style {
             Self::Edges => "EDGES",
             Self::Dither => "DITHER",
         }
+    }
+    pub fn sampling(self) -> Sampling {
+        match self {
+            Self::Braille => Sampling::Braille,
+            Self::Blocks => Sampling::Half,
+            _ => Sampling::Cell,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Sampling {
+    Cell,
+    Half,
+    #[default]
+    Braille,
+}
+
+impl Sampling {
+    pub fn factors(self) -> (usize, usize) {
+        match self {
+            Self::Cell => (1, 1),
+            Self::Half => (1, 2),
+            Self::Braille => (2, 4),
+        }
+    }
+    pub fn pixels(self, size: (u16, u16)) -> (u16, u16) {
+        let (x, y) = self.factors();
+        (
+            size.0.saturating_mul(x as u16),
+            size.1.saturating_mul(y as u16),
+        )
     }
 }
 
@@ -120,6 +152,7 @@ fn source_average(
 #[derive(Default)]
 pub struct Painter {
     samples: Vec<Sample>,
+    pub sampling: Sampling,
 }
 
 impl Painter {
@@ -132,14 +165,19 @@ impl Painter {
         settings: Settings,
     ) {
         let (columns, rows) = (usize::from(size.0), usize::from(size.1));
-        debug_assert_eq!(pixels.len(), columns * rows * 8 * 3);
-        // Subpixel techniques read the shared source directly. Other styles
-        // need only one RGB average + luminance (4 bytes/cell, formerly 34).
+        let (sx, sy) = self.sampling.factors();
+        debug_assert_eq!(pixels.len(), columns * rows * sx * sy * 3);
+        // A compact linear preparation pass vectorizes better than branching
+        // on source layout inside each full-cell glyph conversion.
         if !matches!(settings.style, Style::Blocks | Style::Braille) {
             self.samples.resize(columns * rows, Sample::default());
             for y in 0..rows {
                 for x in 0..columns {
-                    let rgb = source_average(pixels, columns * 2, x, y, 0..4, settings.invert);
+                    let rgb = if self.sampling == Sampling::Cell {
+                        source_rgb(pixels, columns, x, y, settings.invert)
+                    } else {
+                        self.average(pixels, columns, x, y, false, settings.invert)
+                    };
                     self.samples[y * columns + x] = Sample {
                         average: rgb,
                         luma: luma(rgb),
@@ -158,6 +196,37 @@ impl Painter {
                     cell.bg,
                 );
             }
+        }
+    }
+
+    fn average(
+        &self,
+        pixels: &[u8],
+        width: usize,
+        x: usize,
+        y: usize,
+        bottom: bool,
+        invert: bool,
+    ) -> [u8; 3] {
+        match self.sampling {
+            Sampling::Cell => source_rgb(pixels, width, x, y, invert),
+            Sampling::Half => {
+                if bottom {
+                    source_rgb(pixels, width, x, y * 2 + 1, invert)
+                } else {
+                    let a = source_rgb(pixels, width, x, y * 2, invert);
+                    let b = source_rgb(pixels, width, x, y * 2 + 1, invert);
+                    std::array::from_fn(|c| ((u16::from(a[c]) + u16::from(b[c])) / 2) as u8)
+                }
+            }
+            Sampling::Braille => source_average(
+                pixels,
+                width * 2,
+                x,
+                y,
+                if bottom { 2..4 } else { 0..4 },
+                invert,
+            ),
         }
     }
 
@@ -198,11 +267,16 @@ impl Painter {
             Style::Blocks => (
                 '▀',
                 settings.ink(
-                    source_average(pixels, width * 2, x, y, 0..2, settings.invert),
+                    if self.sampling == Sampling::Braille {
+                        source_average(pixels, width * 2, x, y, 0..2, settings.invert)
+                    } else {
+                        let (_, sy) = self.sampling.factors();
+                        source_rgb(pixels, width, x, y * sy, settings.invert)
+                    },
                     true,
                 ),
                 settings.ink(
-                    source_average(pixels, width * 2, x, y, 2..4, settings.invert),
+                    self.average(pixels, width, x, y, true, settings.invert),
                     true,
                 ),
             ),
@@ -213,13 +287,19 @@ impl Painter {
                 let mut sum = [0_u16; 3];
                 let mut count = 0_u16;
                 for (i, bit) in BITS.into_iter().enumerate() {
-                    let rgb = source_rgb(
-                        pixels,
-                        width * 2,
-                        x * 2 + i % 2,
-                        y * 4 + i / 2,
-                        settings.invert,
-                    );
+                    let rgb = match self.sampling {
+                        Sampling::Braille => source_rgb(
+                            pixels,
+                            width * 2,
+                            x * 2 + i % 2,
+                            y * 4 + i / 2,
+                            settings.invert,
+                        ),
+                        Sampling::Half => {
+                            source_rgb(pixels, width, x, y * 2 + i / 4, settings.invert)
+                        }
+                        Sampling::Cell => source_rgb(pixels, width, x, y, settings.invert),
+                    };
                     if settings.level(rgb) >= settings.threshold {
                         mask |= 1 << bit;
                         for c in 0..3 {
@@ -312,6 +392,52 @@ impl Painter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn styles_accept_native_sampling_and_cached_preview_formats() {
+        for sampling in [Sampling::Cell, Sampling::Half, Sampling::Braille] {
+            let (sx, sy) = sampling.factors();
+            let pixels: Vec<_> = (0..4 * 4 * sx * sy * 3)
+                .map(|i| (i * 37 % 256) as u8)
+                .collect();
+            let mut grid = Grid::new(5, 7);
+            let mut painter = Painter {
+                sampling,
+                ..Painter::default()
+            };
+            for style in Style::ALL {
+                painter.paint(&mut grid, &pixels, (4, 4), (0, 0), settings(style));
+            }
+        }
+        let mut painter = Painter {
+            sampling: Sampling::Half,
+            ..Painter::default()
+        };
+        let mut grid = Grid::new(4, 6);
+        painter.paint(
+            &mut grid,
+            &[255, 0, 0, 0, 0, 255],
+            (1, 1),
+            (0, 0),
+            settings(Style::Blocks),
+        );
+        assert_eq!(
+            grid.cells[0],
+            Cell {
+                glyph: '▀',
+                fg: Ink::Rgb([255, 0, 0]),
+                bg: Ink::Rgb([0, 0, 255])
+            }
+        );
+        painter.paint(
+            &mut grid,
+            &[255, 0, 0, 0, 0, 255],
+            (1, 1),
+            (0, 0),
+            settings(Style::Whitespace),
+        );
+        assert_eq!(grid.cells[0].bg, Ink::Rgb([127, 0, 127]));
+    }
 
     #[test]
     fn compact_sampler_matches_direct_rgb_averages_including_inversion() {

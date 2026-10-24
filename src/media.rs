@@ -139,6 +139,7 @@ pub struct Decoder {
     worker: Option<JoinHandle<()>>,
     error_worker: Option<JoinHandle<()>>,
     errors: Arc<Mutex<String>>,
+    frame_bytes: usize,
 }
 
 impl Decoder {
@@ -180,8 +181,9 @@ impl Decoder {
         });
         let (send, frames) = mpsc::sync_channel(3);
         let (recycle, buffers) = mpsc::sync_channel(6);
+        let frame_bytes = usize::from(size.0) * usize::from(size.1) * 3;
         let worker = thread::spawn(move || {
-            let bytes = usize::from(size.0) * usize::from(size.1) * 3;
+            let bytes = frame_bytes;
             let mut index = 0_u64;
             loop {
                 let mut pixels = buffers.try_recv().unwrap_or_else(|_| vec![0; bytes]);
@@ -205,6 +207,7 @@ impl Decoder {
             worker: Some(worker),
             error_worker: Some(error_worker),
             errors,
+            frame_bytes,
         })
     }
 
@@ -213,6 +216,10 @@ impl Decoder {
     }
 
     pub fn recycle(&self, frame: Frame) {
+        // A cached preview may come from the previous sampling/resize decoder.
+        if frame.pixels.len() != self.frame_bytes {
+            return;
+        }
         let _ = self.recycle.try_send(frame.pixels);
     }
 
@@ -291,9 +298,16 @@ mod tests {
             first
         };
         let decoder = Decoder::start(&video.path, (40, 12), 24, 1.0).unwrap();
+        decoder.recycle(Frame {
+            pixels: vec![0; 40 * 12 * 24],
+            position: 0.0,
+        });
         let sought = frame(&decoder);
         assert_eq!(sought.position, 1.0);
         assert_ne!(first.pixels, sought.pixels);
+        for _ in 0..8 {
+            assert_eq!(frame(&decoder).pixels.len(), 40 * 12 * 3);
+        }
     }
 
     #[test]

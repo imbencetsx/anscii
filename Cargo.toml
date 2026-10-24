@@ -17,3 +17,6 @@ unicode-width = "0.2"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1.1.5", features = ["fs", "event"] }
