@@ -136,3 +136,30 @@ Regression tests additionally stop reading terminal output entirely and verify
 that a large-grid player can still quit promptly and restore raw mode. Native
 audio, seeking, and style changes are exercised during 640×192 → 960×288 resizing.
 There is no default spatial downsampling cap or color approximation in this change.
+
+## VideoToolbox decoding, 25 October 2026
+
+macOS now requests VideoToolbox for H.264/HEVC by default (`--hwaccel auto`). The
+accelerator is an input decoding option; the RGB resize/output pipeline is
+unchanged. Unsupported initialization retries software once at the same seek
+offset, frame rate, and dimensions. Other codecs and platforms default to
+software. `--hwaccel off` provides an explicit software override.
+
+Three sequential runs of each decoder processed the same 10-second segment,
+starting at 60 seconds, from the local 1080p 10-bit HEVC MKV. The complete video
+pipeline included 24 FPS filtering, area scaling to 924×260, RGB24 conversion,
+and raw output to `/dev/null`. Median FFmpeg child CPU time was **1.947 s in
+software versus 0.645 s with VideoToolbox**, about **67% less**. Median wall time
+was 0.942 s versus 0.693 s in this unthrottled decode test.
+
+These are FFmpeg-process measurements, excluding terminal rendering, audio, and
+OS/media-engine work. Hardware acceleration does not eliminate all CPU usage.
+The default input request is `-hwaccel videotoolbox` before `-i`. The benchmark
+used the same `-threads 2`, `-filter_threads 1`,
+`-vf fps=24,scale=924:260:flags=area,setsar=1`, `-pix_fmt rgb24`, and
+`-threads 1 -f rawvideo` options for both paths.
+
+Tests force an unavailable accelerator and check software retry at the same
+timestamp, correct frame bytes, and termination on invalid media without retry
+loops. The audio and large-grid PTY fixtures now use H.264 so macOS exercises the
+automatic VideoToolbox request during playback, seeking, style changes, and resizing.

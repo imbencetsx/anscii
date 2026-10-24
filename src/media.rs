@@ -16,6 +16,7 @@ pub struct Metadata {
     pub ratio: f64,
     pub duration: f64,
     pub has_audio: bool,
+    pub videotoolbox_candidate: bool,
 }
 
 pub fn parse_metadata(bytes: &[u8]) -> Result<Metadata, String> {
@@ -62,6 +63,7 @@ pub fn parse_metadata(bytes: &[u8]) -> Result<Metadata, String> {
         ratio,
         duration,
         has_audio,
+        videotoolbox_candidate: matches!(stream["codec_name"].as_str(), Some("h264" | "hevc")),
     })
 }
 
@@ -76,7 +78,7 @@ impl Probe {
     pub fn start(path: PathBuf) -> io::Result<Self> {
         let child = Command::new("ffprobe").args([
             "-v", "error", "-show_entries",
-            "stream=codec_type,width,height,display_aspect_ratio,duration:stream_side_data=rotation:format=duration",
+            "stream=codec_name,codec_type,width,height,display_aspect_ratio,duration:stream_side_data=rotation:format=duration",
             "-of", "json",
         ]).arg(&path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         Ok(Self {
@@ -140,11 +142,32 @@ pub struct Decoder {
     error_worker: Option<JoinHandle<()>>,
     errors: Arc<Mutex<String>>,
     frame_bytes: usize,
+    request: DecodeRequest,
+    delivered: bool,
+}
+
+#[derive(Clone)]
+struct DecodeRequest {
+    path: PathBuf,
+    size: (u16, u16),
+    fps: u16,
+    start: f64,
+    acceleration: Option<&'static str>,
 }
 
 impl Decoder {
-    pub fn start(path: &Path, size: (u16, u16), fps: u16, start: f64) -> io::Result<Self> {
-        let mut child = Command::new("ffmpeg")
+    pub fn start(
+        path: &Path,
+        size: (u16, u16),
+        fps: u16,
+        start: f64,
+        acceleration: Option<&'static str>,
+    ) -> io::Result<Self> {
+        let mut command = Command::new("ffmpeg");
+        if let Some(backend) = acceleration {
+            command.args(["-hwaccel", backend]);
+        }
+        let mut child = command
             .args([
                 "-nostdin",
                 "-hide_banner",
@@ -208,11 +231,56 @@ impl Decoder {
             error_worker: Some(error_worker),
             errors,
             frame_bytes,
+            request: DecodeRequest {
+                path: path.to_owned(),
+                size,
+                fps,
+                start,
+                acceleration,
+            },
+            delivered: false,
         })
     }
 
-    pub fn receive(&self) -> Result<Frame, TryRecvError> {
-        self.frames.as_ref().unwrap().try_recv()
+    pub fn receive(&mut self) -> Result<Frame, TryRecvError> {
+        let result = self
+            .frames
+            .as_ref()
+            .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv);
+        match result {
+            Ok(frame) => {
+                self.delivered = true;
+                Ok(frame)
+            }
+            Err(TryRecvError::Disconnected)
+                if !self.delivered && self.request.acceleration.is_some() =>
+            {
+                // A missing accelerator, unsupported codec/profile, or failed
+                // device initialization must not prevent normal video playback.
+                // Retry once, at the exact same timestamp and sample geometry.
+                self.stop();
+                let request = self.request.clone();
+                match Self::start(
+                    &request.path,
+                    request.size,
+                    request.fps,
+                    request.start,
+                    None,
+                ) {
+                    Ok(software) => {
+                        *self = software;
+                        Err(TryRecvError::Empty)
+                    }
+                    Err(error) => {
+                        self.request.acceleration = None;
+                        *self.errors.lock().unwrap() =
+                            format!("Software decoder fallback failed: {error}");
+                        Err(TryRecvError::Disconnected)
+                    }
+                }
+            }
+            error => error,
+        }
     }
 
     pub fn recycle(&self, frame: Frame) {
@@ -264,6 +332,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unavailable_hardware_retries_software_at_the_same_seek_offset() {
+        use crate::test_support::TestVideo;
+        if !TestVideo::available() {
+            eprintln!("FFmpeg unavailable; skipping integration test");
+            return;
+        }
+        let video = TestVideo::new();
+        let mut decoder = Decoder::start(
+            &video.path,
+            (40, 12),
+            24,
+            1.0,
+            Some("anscii-test-missing-accelerator"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frame = loop {
+            match decoder.receive() {
+                Ok(frame) => break frame,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2))
+                }
+                _ => panic!("Software fallback failed: {}", decoder.error()),
+            }
+        };
+        assert_eq!(frame.position, 1.0);
+        assert_eq!(frame.pixels.len(), 40 * 12 * 3);
+        assert!(decoder.request.acceleration.is_none());
+        assert!(decoder.delivered);
+
+        let bad = video.folder.join("broken.mp4");
+        std::fs::write(&bad, "not a video").unwrap();
+        let mut broken = Decoder::start(
+            &bad,
+            (40, 12),
+            24,
+            0.0,
+            Some("anscii-test-missing-accelerator"),
+        )
+        .unwrap();
+        loop {
+            match broken.receive() {
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(2))
+                }
+                Err(TryRecvError::Disconnected) => break,
+                _ => panic!("Invalid media must terminate after the software retry"),
+            }
+        }
+        assert!(broken.request.acceleration.is_none());
+    }
+
+    #[test]
     fn decoder_seeks_and_cancels_with_a_full_queue() {
         use crate::test_support::TestVideo;
         if !TestVideo::available() {
@@ -271,7 +392,7 @@ mod tests {
             return;
         }
         let video = TestVideo::new();
-        fn frame(decoder: &Decoder) -> Frame {
+        fn frame(decoder: &mut Decoder) -> Frame {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match decoder.receive() {
@@ -284,8 +405,8 @@ mod tests {
             }
         }
         let first = {
-            let mut decoder = Decoder::start(&video.path, (40, 12), 24, 0.0).unwrap();
-            let first = frame(&decoder);
+            let mut decoder = Decoder::start(&video.path, (40, 12), 24, 0.0, None).unwrap();
+            let first = frame(&mut decoder);
             assert_eq!(first.pixels.len(), 40 * 12 * 3);
             assert_eq!(first.position, 0.0);
             thread::sleep(Duration::from_millis(100)); // fill bounded queue
@@ -297,16 +418,16 @@ mod tests {
             );
             first
         };
-        let decoder = Decoder::start(&video.path, (40, 12), 24, 1.0).unwrap();
+        let mut decoder = Decoder::start(&video.path, (40, 12), 24, 1.0, None).unwrap();
         decoder.recycle(Frame {
             pixels: vec![0; 40 * 12 * 24],
             position: 0.0,
         });
-        let sought = frame(&decoder);
+        let sought = frame(&mut decoder);
         assert_eq!(sought.position, 1.0);
         assert_ne!(first.pixels, sought.pixels);
         for _ in 0..8 {
-            assert_eq!(frame(&decoder).pixels.len(), 40 * 12 * 3);
+            assert_eq!(frame(&mut decoder).pixels.len(), 40 * 12 * 3);
         }
     }
 
@@ -320,6 +441,9 @@ mod tests {
         assert!(!meta.has_audio);
         let audio_first = br#"{"streams":[{"codec_type":"audio"},{"codec_type":"video","width":640,"height":360}],"format":{"duration":"3"}}"#;
         assert!(parse_metadata(audio_first).unwrap().has_audio);
+        let hevc = br#"{"streams":[{"codec_type":"video","codec_name":"hevc","width":1920,"height":1080}]}"#;
+        assert!(parse_metadata(hevc).unwrap().videotoolbox_candidate);
+        assert!(!meta.videotoolbox_candidate);
     }
 
     #[test]

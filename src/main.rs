@@ -62,6 +62,24 @@ enum Depth {
     Palette,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum HardwareMode {
+    Auto,
+    Off,
+    #[value(name = "videotoolbox")]
+    VideoToolbox,
+}
+
+impl HardwareMode {
+    fn backend(self, candidate: bool) -> Option<&'static str> {
+        match self {
+            Self::VideoToolbox => Some("videotoolbox"),
+            Self::Auto if cfg!(target_os = "macos") && candidate => Some("videotoolbox"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -97,6 +115,9 @@ struct Args {
     /// Skip audio decoding/output entirely
     #[arg(long)]
     no_audio: bool,
+    /// Video decoding: auto uses VideoToolbox for H.264/HEVC on macOS
+    #[arg(long, value_enum, default_value = "auto")]
+    hwaccel: HardwareMode,
     /// Measure renderer CPU time and terminal output without opening the TUI
     #[arg(long)]
     benchmark: bool,
@@ -227,6 +248,7 @@ struct App {
     no_audio: bool,
     audio_failed: bool,
     audio_complete: bool,
+    hwaccel: HardwareMode,
 }
 
 impl App {
@@ -250,6 +272,7 @@ impl App {
                 ratio: 16.0 / 9.0,
                 duration: 0.0,
                 has_audio: false,
+                videotoolbox_candidate: false,
             },
             decoder: None,
             pending: None,
@@ -279,6 +302,7 @@ impl App {
             no_audio: args.no_audio,
             audio_failed: false,
             audio_complete: false,
+            hwaccel: args.hwaccel,
         })
     }
 
@@ -351,6 +375,7 @@ impl App {
             self.decoder_sampling.pixels(size),
             self.fps,
             self.position,
+            self.hwaccel.backend(self.metadata.videotoolbox_candidate),
         )?);
         self.decoder_size = size;
         self.refreshing = false;
@@ -371,6 +396,7 @@ impl App {
             self.decoder_sampling.pixels(self.decoder_size),
             self.fps,
             clamp_seek(position, self.metadata.duration, self.fps),
+            self.hwaccel.backend(self.metadata.videotoolbox_candidate),
         )?);
         self.refreshing = true;
         Ok(())
@@ -450,7 +476,7 @@ impl App {
             return Ok(dirty);
         }
         if self.clock.is_none() || (self.refreshing && self.paused) {
-            match self.decoder.as_ref().unwrap().receive() {
+            match self.decoder.as_mut().unwrap().receive() {
                 Ok(frame) => {
                     self.clock = Some((now, frame.position));
                     self.accept(frame);
@@ -480,7 +506,7 @@ impl App {
         // Limit each catch-up pass so input always gets another turn.
         for _ in 0..64 {
             if self.pending.is_none() {
-                match self.decoder.as_ref().unwrap().receive() {
+                match self.decoder.as_mut().unwrap().receive() {
                     Ok(frame) => self.pending = Some(frame),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -1098,6 +1124,29 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_auto_is_platform_and_codec_aware_and_can_be_disabled() {
+        assert_eq!(HardwareMode::Off.backend(true), None);
+        assert_eq!(HardwareMode::Auto.backend(false), None);
+        assert_eq!(
+            HardwareMode::Auto.backend(true),
+            if cfg!(target_os = "macos") {
+                Some("videotoolbox")
+            } else {
+                None
+            }
+        );
+        assert_eq!(
+            HardwareMode::VideoToolbox.backend(false),
+            Some("videotoolbox")
+        );
+        assert_eq!(Args::parse_from(["anscii"]).hwaccel, HardwareMode::Auto);
+        assert_eq!(
+            Args::parse_from(["anscii", "--hwaccel", "off"]).hwaccel,
+            HardwareMode::Off
+        );
+    }
 
     #[test]
     fn playback_pause_seek_and_catch_up_use_the_media_clock() {

@@ -23,7 +23,7 @@ class LargeTerminalTests(unittest.TestCase):
         cls.folder = Path(cls.temp.name)
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=24",
                         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "8",
-                        "-c:v", "mpeg4", "-c:a", "aac", str(cls.folder / "clip.mp4")], check=True)
+                        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(cls.folder / "clip.mp4")], check=True)
 
     @classmethod
     def tearDownClass(cls):

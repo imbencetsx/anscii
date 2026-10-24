@@ -24,7 +24,7 @@ class TerminalTests(unittest.TestCase):
             clip = Path(folder) / "audio clip.mp4"
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24",
                             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "4",
-                            "-c:v", "mpeg4", "-c:a", "aac", str(clip)], check=True)
+                            "-c:v", "libx264", "-c:a", "aac", str(clip)], check=True)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
             # Exercise the actual native device clock without making test noise.

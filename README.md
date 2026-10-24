@@ -24,6 +24,20 @@ terminal. On macOS, install FFmpeg with `brew install ffmpeg`. After building, n
 Rust toolchain or Python is needed to run the binary. The old
 `python3 anscii.py videos` command forwards to the same Rust binary.
 
+On macOS, H.264 and HEVC video use **VideoToolbox hardware decoding by default**.
+Other codecs and platforms use software decoding. If the accelerator cannot
+initialize or produce the first frame, playback retries in software at the same
+time and resolution. Audio, seeking, and rendering styles keep their existing controls.
+
+```sh
+anscii videos                         # automatic hardware decoding on macOS
+anscii videos --hwaccel off           # software decoding
+anscii videos --hwaccel videotoolbox  # explicitly request VideoToolbox
+```
+
+Hardware decoding offloads source decompression. Resizing, RGB conversion, ASCII
+processing, and terminal painting still have CPU costs.
+
 | Input | Action |
 | --- | --- |
 | Up / Down (or K / J) | Select a file |
