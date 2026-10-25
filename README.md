@@ -49,8 +49,8 @@ processing, and terminal painting still have CPU costs.
 | Click timeline | Jump to that point; preserves pause |
 | C | Cycle color, white, amber |
 | T | Cycle rendering techniques |
-| 1–6 | Choose ASCII, whitespace, blocks, Braille, edges, or dither |
-| + / - | Raise / lower dot, edge, and dither cutoff |
+| 1–6 | Choose ASCII, whitespace, blocks, dense, solid, or shade |
+| + / - | Increase / decrease character fill density |
 | I | Invert the image |
 | R | Rescan folder |
 | Q / Esc / Ctrl-C | Quit |
@@ -90,26 +90,25 @@ Switch styles while playing or paused. The active style appears in the header.
   backgrounds. White/amber mode produces shaded monochrome background pixels.
 - **3 / Blocks**: half-block characters with separate top and bottom colors,
   providing twice the vertical color detail of a full-cell pixel.
-- **4 / Braille**: eight independently sampled dots per character (2×4), for
-  finer silhouettes and detail.
-- **5 / Edges**: Sobel contours drawn with directional `|`, `-`, `/`, and `\` lines.
-- **6 / Dither**: an ordered halftone pattern made from dots.
+- **4 / Dense**: fuller `oOQ0#%@` characters, including in darker areas, for a
+  more filled picture with the original sampled colors.
+- **5 / Solid**: `@` for every non-black cell; color carries the image detail.
+- **6 / Shade**: `░▒▓█` shading characters, from light texture to full coverage.
 
-Lower the cutoff with **-** for more dots/contours, or raise it with **+** for fewer.
-**I** toggles an inverted image. Cutoff affects Braille, edges, and dither; all
-styles support color, white, amber, and the 256-color fallback. Braille, blocks,
-and dither require a font with the corresponding Unicode glyphs.
+Use **+ / -** to increase/decrease character fill density in ASCII, Dense, Solid,
+and Shade. The default is 128. Density changes glyph selection, preserving sampled
+RGB colors. **I** toggles inversion. All styles support color, white, amber, and
+256-color output. Blocks and Shade need the corresponding Unicode font glyphs.
 
 ```sh
-anscii videos --style braille --mode white
-anscii videos --style whitespace
-anscii videos --style edges --threshold 64 --invert
+anscii videos --style dense
+anscii videos --style solid
+anscii videos --style shade --density 160
 ```
 
-Each style decodes only the samples it can display: one per cell for ASCII,
-whitespace, edges, and dither; two vertical samples for blocks; and 2×4 for Braille.
-FFmpeg performs the source averaging directly, avoiding an unnecessary 8× RGB
-transfer and extra CPU averaging for full-cell styles. No terminal cells are lost.
+Each style decodes one RGB sample per cell, except Blocks which uses two vertical
+samples. FFmpeg averages the source directly, avoiding extra RGB transfer and CPU
+averaging. No terminal cells are lost.
 
 Style changes show a cached preview immediately. When the sample layout changes,
 the video decoder refines that preview in the background at the same media time;
@@ -140,16 +139,16 @@ when behind instead of playing in slow motion. Input polling follows frame
 deadlines rather than waking every 4 ms. Window resizing is debounced to avoid
 repeatedly restarting FFmpeg.
 
-Styles sample only the data they need. The compact average/luminance cache uses
-4 bytes per cell; blocks and Braille read the shared subpixels directly. Audio
+Styles sample only the data they need. The compact RGB cache uses
+3 bytes per cell; blocks read the two vertical samples directly. Audio
 has a bounded half-second PCM ring buffer, with no allocations or locks in its
 real-time callback. Pausing suspends native audio callbacks where supported.
 
 ### Large terminals / small fonts
 
 Smaller fonts automatically use the extra rows and columns. There is no hidden
-resolution cap or automatic reduction to 256 colors. Braille gives eight dot
-positions per cell; blocks give two independently colored vertical pixels.
+resolution cap or automatic reduction to 256 colors. Blocks give two
+independently colored vertical pixels per cell.
 
 Terminal encoding and output run on a separate presenter thread. At most one
 screen is in flight: if the terminal is busy, the app waits to compose the latest
@@ -159,7 +158,7 @@ be interrupted on quit, including when the terminal stops reading. Grid storage
 is reused, and mouse-motion reports no longer rebuild a large video image.
 
 ```sh
-anscii videos --style braille
+anscii videos --style dense
 anscii videos --style blocks
 anscii --benchmark --benchmark-size 640x192
 anscii --benchmark --benchmark-size 960x288
