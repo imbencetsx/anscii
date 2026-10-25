@@ -199,7 +199,7 @@ size (2,343,780 bytes/frame). This measures CPU encoding, not Linux GPU decoding
 or terminal painting. Absolute timings and improvements vary by CPU/compiler.
 
 Linux hardware could not be benchmarked here: the host is macOS and Docker's
-daemon is unavailable. `.github/workflows/linux.yml` adds Ubuntu 22.04/24.04 release
+daemon is unavailable. `.github/workflows/ci.yml` includes Ubuntu 22.04/24.04 release
 builds, lint/unit checks, PTY playback, large-grid/backpressure regression checks,
 and uploaded renderer benchmark results. These CI runs have not been executed
 locally; native audio-device tests and physical GPU measurements remain separate.

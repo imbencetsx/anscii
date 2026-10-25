@@ -1,15 +1,27 @@
-name: macOS
-on: [push, pull_request]
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  macos:
+  test:
     strategy:
       matrix:
-        os: [macos-15, macos-15-intel]
+        os: [ubuntu-22.04, ubuntu-24.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: System dependencies
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev ffmpeg
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
       - name: Rust tools
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
@@ -24,8 +36,8 @@ jobs:
       - name: Large terminal and blocked output
         run: /tmp/anscii-tests/bin/python tests/large_terminal.py -v
       - name: Renderer benchmark
-        run: target/release/anscii --benchmark --benchmark-size 640x192 | tee macos-benchmark.txt
+        run: target/release/anscii --benchmark --benchmark-size 640x192 | tee benchmark.txt
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-${{ matrix.os }}
-          path: macos-benchmark.txt
+          path: benchmark.txt
