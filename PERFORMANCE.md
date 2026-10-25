@@ -163,3 +163,43 @@ Tests force an unavailable accelerator and check software retry at the same
 timestamp, correct frame bytes, and termination on invalid media without retry
 loops. The audio and large-grid PTY fixtures now use H.264 so macOS exercises the
 automatic VideoToolbox request during playback, seeking, style changes, and resizing.
+
+## Linux acceleration and color encoding (2026-10-25)
+
+Previously `--hwaccel auto` selected hardware only on macOS; Linux always used
+software decoding. Linux now passes `-hwaccel auto` to FFmpeg, allowing selection
+based on its decoder/device support instead of hardcoding a GPU vendor. Explicit
+`--hwaccel vaapi` and `--hwaccel cuda` overrides cover Intel/AMD and NVIDIA setups;
+`off` keeps the software path. Initial accelerator failures retain the existing
+single software retry at the same seek time and sample dimensions. Automatic
+FFmpeg selection can itself continue in software when no accelerator is usable.
+GPU availability and performance depend on the driver, codec/profile, and transfer
+costs; see [FFmpeg's hardware decoding documentation](https://www.ffmpeg.org/ffmpeg.html#Advanced-Video-options).
+No resolution, color-depth, or frame-rate reduction was added.
+
+The shared ANSI encoder now uses a 1 KiB compile-time decimal table for RGB and
+indexed-color components. Cursor coordinates retain the general integer encoder.
+This eliminates repeated division/temporary digit buffers on every color change
+without changing any emitted escape sequences. Every 0–255 entry is checked
+against standard decimal conversion in a regression test.
+
+Release benchmark medians, five runs each, 640×192 terminal grid on this workspace's
+Apple Silicon macOS host (milliseconds per frame):
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| Full motion | 1.675 | 1.501 |
+| Sparse motion | 0.414 | 0.391 |
+| Static | 0.144 | 0.140 |
+| ASCII compose + diff | 0.610 | 0.592 |
+| Blocks compose + diff | 0.615 | 0.595 |
+
+The full-motion encoding measurement improved about 10.4%, with unchanged output
+size (2,343,780 bytes/frame). This measures CPU encoding, not Linux GPU decoding
+or terminal painting. Absolute timings and improvements vary by CPU/compiler.
+
+Linux hardware could not be benchmarked here: the host is macOS and Docker's
+daemon is unavailable. `.github/workflows/linux.yml` adds Ubuntu 22.04/24.04 release
+builds, lint/unit checks, PTY playback, large-grid/backpressure regression checks,
+and uploaded renderer benchmark results. These CI runs have not been executed
+locally; native audio-device tests and physical GPU measurements remain separate.

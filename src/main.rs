@@ -66,6 +66,8 @@ enum Depth {
 enum HardwareMode {
     Auto,
     Off,
+    Vaapi,
+    Cuda,
     #[value(name = "videotoolbox")]
     VideoToolbox,
 }
@@ -73,8 +75,14 @@ enum HardwareMode {
 impl HardwareMode {
     fn backend(self, candidate: bool) -> Option<&'static str> {
         match self {
+            Self::Vaapi => Some("vaapi"),
+            Self::Cuda => Some("cuda"),
             Self::VideoToolbox => Some("videotoolbox"),
             Self::Auto if cfg!(target_os = "macos") && candidate => Some("videotoolbox"),
+            // FFmpeg checks decoder/device support and falls back to software.
+            // Do not guess the vendor from /dev/dri: it misses NVIDIA, hybrid
+            // GPUs, and containers with a different device configuration.
+            Self::Auto if cfg!(target_os = "linux") => Some("auto"),
             _ => None,
         }
     }
@@ -115,7 +123,7 @@ struct Args {
     /// Skip audio decoding/output entirely
     #[arg(long)]
     no_audio: bool,
-    /// Video decoding: auto uses VideoToolbox for H.264/HEVC on macOS
+    /// Video decoding: auto selects Linux GPU acceleration or macOS VideoToolbox
     #[arg(long, value_enum, default_value = "auto")]
     hwaccel: HardwareMode,
     /// Measure renderer CPU time and terminal output without opening the TUI
@@ -1128,11 +1136,20 @@ mod tests {
     #[test]
     fn hardware_auto_is_platform_and_codec_aware_and_can_be_disabled() {
         assert_eq!(HardwareMode::Off.backend(true), None);
-        assert_eq!(HardwareMode::Auto.backend(false), None);
+        assert_eq!(
+            HardwareMode::Auto.backend(false),
+            if cfg!(target_os = "linux") {
+                Some("auto")
+            } else {
+                None
+            }
+        );
         assert_eq!(
             HardwareMode::Auto.backend(true),
             if cfg!(target_os = "macos") {
                 Some("videotoolbox")
+            } else if cfg!(target_os = "linux") {
+                Some("auto")
             } else {
                 None
             }
@@ -1141,6 +1158,8 @@ mod tests {
             HardwareMode::VideoToolbox.backend(false),
             Some("videotoolbox")
         );
+        assert_eq!(HardwareMode::Vaapi.backend(false), Some("vaapi"));
+        assert_eq!(HardwareMode::Cuda.backend(false), Some("cuda"));
         assert_eq!(Args::parse_from(["anscii"]).hwaccel, HardwareMode::Auto);
         assert_eq!(
             Args::parse_from(["anscii", "--hwaccel", "off"]).hwaccel,

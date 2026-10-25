@@ -1,0 +1,31 @@
+name: Linux
+on: [push, pull_request]
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev ffmpeg
+      - name: Rust tools
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Python test dependencies
+        run: python3 -m venv /tmp/anscii-tests && /tmp/anscii-tests/bin/pip install -r requirements-dev.txt
+      - name: Terminal playback (no audio device required)
+        run: /tmp/anscii-tests/bin/python tests/terminal_smoke.py TerminalTests.test_play_pause_click_seek_color_resize_eof_and_quit -v
+      - name: Large terminal and blocked output
+        run: /tmp/anscii-tests/bin/python tests/large_terminal.py -v
+      - name: Renderer benchmark
+        run: target/release/anscii --benchmark --benchmark-size 640x192 | tee linux-benchmark.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.os }}
+          path: linux-benchmark.txt

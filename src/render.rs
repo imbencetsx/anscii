@@ -167,7 +167,7 @@ fn color(out: &mut Vec<u8>, ink: Ink, background: bool) {
                 if i != 0 {
                     out.push(b';');
                 }
-                number(out, u16::from(channel));
+                byte_number(out, channel);
             }
             out.push(b'm');
         }
@@ -177,15 +177,52 @@ fn color(out: &mut Vec<u8>, ink: Ink, background: bool) {
             } else {
                 b"\x1b[38;5;"
             });
-            number(out, u16::from(index));
+            byte_number(out, index);
             out.push(b'm');
         }
     }
 }
 
+// Color components dominate moving-frame encoding. Cache their decimal ASCII
+// once instead of dividing and building a temporary digit buffer per component.
+const BYTE_DECIMALS: [[u8; 4]; 256] = {
+    let mut table = [[0; 4]; 256];
+    let mut n = 0;
+    while n < 256 {
+        table[n] = if n < 10 {
+            [b'0' + n as u8, 0, 0, 1]
+        } else if n < 100 {
+            [b'0' + (n / 10) as u8, b'0' + (n % 10) as u8, 0, 2]
+        } else {
+            [
+                b'0' + (n / 100) as u8,
+                b'0' + (n / 10 % 10) as u8,
+                b'0' + (n % 10) as u8,
+                3,
+            ]
+        };
+        n += 1;
+    }
+    table
+};
+
+fn byte_number(out: &mut Vec<u8>, n: u8) {
+    let entry = &BYTE_DECIMALS[usize::from(n)];
+    out.extend_from_slice(&entry[..usize::from(entry[3])]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_color_numbers_match_every_component_exactly() {
+        for n in 0..=255_u8 {
+            let mut output = Vec::new();
+            byte_number(&mut output, n);
+            assert_eq!(output, n.to_string().as_bytes());
+        }
+    }
 
     #[test]
     fn static_frames_write_nothing_and_updates_are_small() {
