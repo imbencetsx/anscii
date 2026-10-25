@@ -43,12 +43,17 @@ pub fn parse_metadata(bytes: &[u8]) -> Result<Metadata, String> {
     {
         ratio = a / b;
     }
-    if let Some(sides) = stream["side_data_list"].as_array() {
-        for side in sides {
-            if side["rotation"].as_f64().unwrap_or(0.0).abs() % 180.0 == 90.0 {
-                ratio = 1.0 / ratio;
-            }
-        }
+    let rotation = stream["side_data_list"]
+        .as_array()
+        .and_then(|sides| sides.iter().find_map(|side| side["rotation"].as_f64()))
+        .or_else(|| {
+            stream["tags"]["rotate"]
+                .as_str()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+    if rotation.abs() % 180.0 == 90.0 {
+        ratio = 1.0 / ratio;
     }
     let duration = data["format"]["duration"]
         .as_str()
@@ -70,19 +75,28 @@ pub fn parse_metadata(bytes: &[u8]) -> Result<Metadata, String> {
 /// Metadata probing is polled, never waited for on the input/rendering path.
 pub struct Probe {
     child: Option<Child>,
+    output: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    errors: Option<JoinHandle<io::Result<Vec<u8>>>>,
     pub path: PathBuf,
     started: Instant,
 }
 
 impl Probe {
     pub fn start(path: PathBuf) -> io::Result<Self> {
-        let child = Command::new("ffprobe").args([
+        // FFprobe 4.4 (Ubuntu 22.04) has no `stream_side_data` section name.
+        // Its parent list exists in both old and new versions and includes the
+        // rotation fields without enabling a scan of every frame/packet.
+        let mut child = Command::new("ffprobe").args([
             "-v", "error", "-show_entries",
-            "stream=codec_name,codec_type,width,height,display_aspect_ratio,duration:stream_side_data=rotation:format=duration",
+            "stream=codec_name,codec_type,width,height,display_aspect_ratio,duration:stream_side_data_list:stream_tags=rotate:format=duration",
             "-of", "json",
-        ]).arg(&path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        ]).arg(&path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let output = probe_reader(child.stdout.take().unwrap(), 1024 * 1024);
+        let errors = probe_reader(child.stderr.take().unwrap(), 4096);
         Ok(Self {
             child: Some(child),
+            output: Some(output),
+            errors: Some(errors),
             path,
             started: Instant::now(),
         })
@@ -92,12 +106,15 @@ impl Probe {
         let child = self.child.as_mut()?;
         match child.try_wait() {
             Ok(Some(status)) => {
-                let output = self.child.take().unwrap().wait_with_output();
-                Some(output.map_err(|e| e.to_string()).and_then(|o| {
+                self.child.take(); // try_wait already reaped the exited child
+                let output = join_probe_reader(self.output.take().unwrap());
+                let errors = join_probe_reader(self.errors.take().unwrap()).unwrap_or_default();
+                Some(output.and_then(|bytes| {
                     if status.success() {
-                        parse_metadata(&o.stdout)
+                        parse_metadata(&bytes)
                     } else {
-                        Err("Could not read this video".into())
+                        let details = String::from_utf8_lossy(&errors);
+                        Err(format!("FFprobe failed ({status}): {}", details.trim()))
                     }
                 }))
             }
@@ -118,7 +135,34 @@ impl Probe {
             let _ = child.kill();
             let _ = child.wait();
         }
+        for reader in [self.output.take(), self.errors.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = reader.join();
+        }
     }
+}
+
+// Drain both pipes while FFprobe runs, so diagnostics or unusually large stream
+// metadata cannot fill a pipe and deadlock the process before try_wait succeeds.
+fn probe_reader(
+    mut pipe: impl Read + Send + 'static,
+    limit: u64,
+) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.by_ref().take(limit).read_to_end(&mut bytes)?;
+        io::copy(&mut pipe, &mut io::sink())?;
+        Ok(bytes)
+    })
+}
+
+fn join_probe_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| "FFprobe output reader panicked".to_owned())?
+        .map_err(|error| format!("Could not read FFprobe output: {error}"))
 }
 
 impl Drop for Probe {
@@ -332,6 +376,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_probe_reads_video_and_reports_ffprobe_errors() {
+        use crate::test_support::TestVideo;
+        if !TestVideo::available() {
+            return;
+        }
+        let video = TestVideo::new();
+        fn result(probe: &mut Probe) -> Result<Metadata, String> {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(result) = probe.poll() {
+                    return result;
+                }
+                assert!(Instant::now() < deadline, "Metadata probe did not finish");
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let mut probe = Probe::start(video.path.clone()).unwrap();
+        let meta = result(&mut probe).expect("Fixture must be readable by FFprobe");
+        assert!((meta.ratio - 160.0 / 90.0).abs() < 0.001);
+        assert!((meta.duration - 2.0).abs() < 0.05);
+        assert!(!meta.has_audio);
+        assert!(probe.poll().is_none());
+
+        let invalid = video.folder.join("broken.mp4");
+        std::fs::write(&invalid, b"not a video").unwrap();
+        let error = result(&mut Probe::start(invalid).unwrap()).unwrap_err();
+        assert!(error.contains("FFprobe failed"), "{error}");
+        assert!(
+            error.contains("broken.mp4"),
+            "Original stderr missing: {error}"
+        );
+    }
+
+    #[test]
+    fn probe_reader_caps_retained_output_and_drains_the_rest() {
+        let bytes = std::io::Cursor::new(vec![b'x'; 128 * 1024]);
+        assert_eq!(
+            join_probe_reader(probe_reader(bytes, 4096)).unwrap(),
+            vec![b'x'; 4096]
+        );
+    }
+
+    #[test]
     fn unavailable_hardware_retries_software_at_the_same_seek_offset() {
         use crate::test_support::TestVideo;
         if !TestVideo::available() {
@@ -436,6 +523,10 @@ mod tests {
         let data = br#"{"streams":[{"width":1920,"height":1080,"display_aspect_ratio":"16:9","side_data_list":[{"rotation":-90}]}],"format":{"duration":"N/A"}}"#;
         let meta = parse_metadata(data).unwrap();
         assert!((meta.ratio - 9.0 / 16.0).abs() < 0.001);
+        let legacy = br#"{"streams":[{"width":1920,"height":1080,"tags":{"rotate":"270"}}]}"#;
+        assert!((parse_metadata(legacy).unwrap().ratio - 9.0 / 16.0).abs() < 0.001);
+        let both = br#"{"streams":[{"width":1920,"height":1080,"tags":{"rotate":"270"},"side_data_list":[{"rotation":90}]}]}"#;
+        assert!((parse_metadata(both).unwrap().ratio - 9.0 / 16.0).abs() < 0.001);
         assert_eq!(meta.duration, 0.0);
         assert!(parse_metadata(br#"{"streams":[]}"#).is_err());
         assert!(!meta.has_audio);

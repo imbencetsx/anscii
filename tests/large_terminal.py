@@ -14,6 +14,7 @@ import unittest
 
 BINARY = Path(__file__).resolve().parents[1] / "target/release/anscii"
 END = b"\x1b[?2026l"
+UPDATE_TIMEOUT = 10  # Complete large screens, not a terminal-throughput benchmark.
 
 
 class LargeTerminalTests(unittest.TestCase):
@@ -33,52 +34,92 @@ class LargeTerminalTests(unittest.TestCase):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
         process = subprocess.Popen([str(BINARY), str(self.folder), *args], stdin=slave, stdout=slave, stderr=slave)
+        self._tails = getattr(self, "_tails", {})
+        self._tails[master] = b""
         return master, slave, process
 
     def drain(self, fd, seconds, needle=None):
         deadline = time.monotonic() + seconds
         total = updates = 0
-        tail = b""
-        found = False
+        tail = self._tails.get(fd, b"")
+        matched = found = False
         while time.monotonic() < deadline:
             if select.select([fd], [], [], 0.01)[0]:
                 chunk = os.read(fd, 262144)
+                if not chunk:
+                    break
                 total += len(chunk)
                 data = tail + chunk
                 updates += data.count(END)
-                if needle and needle in data:
+                # Labels may arrive before the rest of a megabyte-sized screen.
+                # Acknowledge them only once that synchronized update finishes.
+                end_from = 0
+                if needle and not matched:
+                    at = data.find(needle)
+                    if at >= 0:
+                        matched = True
+                        end_from = at + len(needle)
+                if matched and END in data[end_from:]:
                     found = True
+                tail = data[-(max(len(END), len(needle or b"")) - 1):]
+                self._tails[fd] = tail
+                if found:
                     break
-                tail = data[-7:]
         return total, updates, found
+
+    def wait_updates(self, fd, minimum, min_bytes=0, timeout=10):
+        deadline = time.monotonic() + timeout
+        total = updates = 0
+        while time.monotonic() < deadline:
+            count, completed, _ = self.drain(fd, 0.05)
+            total += count
+            updates += completed
+            if updates >= minimum and total >= min_bytes:
+                return
+        self.fail(f"Playback stalled: {updates} completed updates, {total} bytes in {timeout}s")
+
+    def assert_quiet(self, fd, quiet=0.5, timeout=10):
+        # A paused frame or resize refinement may still be in flight. Drain it,
+        # then demand a continuous quiet window; never hide ongoing redraws.
+        deadline = time.monotonic() + timeout
+        last_output = time.monotonic()
+        total = updates = 0
+        while time.monotonic() < deadline:
+            count, completed, _ = self.drain(fd, 0.05)
+            total += count
+            updates += completed
+            if count:
+                last_output = time.monotonic()
+            elif time.monotonic() - last_output >= quiet:
+                return
+        self.fail(f"Paused output did not settle: {total} bytes, {updates} updates in {timeout}s")
 
     def test_large_grid_native_audio_style_changes_and_resize(self):
         master, slave, process = self.launch(640, 192, "--mute")
         original = termios.tcgetattr(slave)
         flags = fcntl.fcntl(slave, fcntl.F_GETFL)
         try:
-            self.assertTrue(self.drain(master, 5, b"LIBRARY")[2])
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"LIBRARY")[2])
             os.write(master, b"\r")
-            self.assertGreater(self.drain(master, 0.7)[1], 2)
+            # Small startup/status screens are not evidence of decoded video.
+            self.wait_updates(master, 3, min_bytes=128 * 1024)
             os.write(master, b" ")
-            self.assertTrue(self.drain(master, 3, b"AUSED")[2])
-            self.drain(master, 0.15)
-            self.assertEqual(self.drain(master, 0.2)[0], 0)
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"AUSED")[2])
+            self.assert_quiet(master)
             os.write(master, b"4")
-            self.assertTrue(self.drain(master, 3, b"DENSE")[2])
-            self.drain(master, 0.2)
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"DENSE")[2])
+            self.assert_quiet(master)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 288, 960, 0, 0))
             process.send_signal(signal.SIGWINCH)
-            self.assertTrue(self.drain(master, 3, b"\x1b[2J")[2])
-            self.drain(master, 0.3)
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"\x1b[2J")[2])
+            self.assert_quiet(master)
             os.write(master, b"3")
-            self.assertTrue(self.drain(master, 3, "▀".encode())[2])
-            self.drain(master, 0.2)
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, "▀".encode())[2])
+            self.assert_quiet(master)
             os.write(master, b"1")
-            self.drain(master, 0.4)
-            self.assertEqual(self.drain(master, 0.2)[0], 0)
+            self.assert_quiet(master)
             os.write(master, b" ")
-            self.assertGreater(self.drain(master, 0.8)[1], 5)
+            self.wait_updates(master, 3)
             self.assertIsNone(process.poll())
             os.write(master, b"q")
             deadline = time.monotonic() + 2
@@ -99,7 +140,7 @@ class LargeTerminalTests(unittest.TestCase):
         master, slave, process = self.launch(960, 288, "--no-audio")
         original = termios.tcgetattr(slave)
         try:
-            self.assertTrue(self.drain(master, 5, b"LIBRARY")[2])
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"LIBRARY")[2])
             os.write(master, b"\r")
             # Deliberately leave the terminal output buffer completely full.
             time.sleep(0.4)

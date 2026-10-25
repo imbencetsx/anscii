@@ -1,0 +1,47 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev ffmpeg
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+      - name: Media tool versions
+        run: |
+          ffmpeg -version
+          ffprobe -version
+      - name: Rust tools
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Python test dependencies
+        run: python3 -m venv /tmp/anscii-tests && /tmp/anscii-tests/bin/pip install -r requirements-dev.txt
+      - name: Terminal playback (no audio device required)
+        run: /tmp/anscii-tests/bin/python tests/terminal_smoke.py TerminalTests.test_play_pause_click_seek_color_resize_eof_and_quit -v
+      - name: Large terminal and blocked output
+        run: /tmp/anscii-tests/bin/python tests/large_terminal.py -v
+      - name: Renderer benchmark
+        run: target/release/anscii --benchmark --benchmark-size 640x192 | tee benchmark.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.os }}
+          path: benchmark.txt

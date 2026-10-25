@@ -25,18 +25,31 @@ Rust toolchain or Python is needed to run the binary. The old
 `python3 anscii.py videos` command forwards to the same Rust binary.
 
 On macOS, H.264 and HEVC video use **VideoToolbox hardware decoding by default**.
-Other codecs and platforms use software decoding. If the accelerator cannot
-initialize or produce the first frame, playback retries in software at the same
-time and resolution. Audio, seeking, and rendering styles keep their existing controls.
+On Linux, the default asks FFmpeg to select an available accelerator for the video
+and installed drivers. CPU-only systems continue in software. If an explicit
+accelerator cannot produce the first frame, playback retries in software at the
+same time and resolution.
 
 ```sh
-anscii videos                         # automatic hardware decoding on macOS
-anscii videos --hwaccel off           # software decoding
-anscii videos --hwaccel videotoolbox  # explicitly request VideoToolbox
+anscii videos                         # automatic hardware selection
+anscii videos --hwaccel off           # CPU decoding
+anscii videos --hwaccel vaapi         # Intel/AMD on Linux
+anscii videos --hwaccel cuda          # NVIDIA on Linux
+anscii videos --hwaccel videotoolbox  # Apple on macOS
 ```
 
-Hardware decoding offloads source decompression. Resizing, RGB conversion, ASCII
-processing, and terminal painting still have CPU costs.
+Linux needs an FFmpeg build with the relevant accelerator and working GPU drivers.
+`ffmpeg -hwaccels` lists compiled backends, not proof that a usable device exists.
+VAAPI needs access to the GPU render device (typically `/dev/dri/renderD128`);
+NVIDIA needs the appropriate driver and video decoding libraries. No root access
+is needed by the player. Containers must have the required device/driver access.
+
+Hardware decoding offloads source decompression. RGB conversion, resizing, ASCII
+processing, and terminal painting still have CPU costs. GPU-to-CPU transfers can
+outweigh decoding savings on some systems or small videos: compare `--hwaccel off`
+with the default on your machine. The player keeps the same resolution and colors.
+For CPU-only machines or slower terminals, `--fps 15` reduces per-second work;
+`--color-depth 256` is an explicit quality/bandwidth tradeoff, never automatic.
 
 | Input | Action |
 | --- | --- |

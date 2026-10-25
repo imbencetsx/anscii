@@ -66,6 +66,8 @@ enum Depth {
 enum HardwareMode {
     Auto,
     Off,
+    Vaapi,
+    Cuda,
     #[value(name = "videotoolbox")]
     VideoToolbox,
 }
@@ -73,8 +75,14 @@ enum HardwareMode {
 impl HardwareMode {
     fn backend(self, candidate: bool) -> Option<&'static str> {
         match self {
+            Self::Vaapi => Some("vaapi"),
+            Self::Cuda => Some("cuda"),
             Self::VideoToolbox => Some("videotoolbox"),
             Self::Auto if cfg!(target_os = "macos") && candidate => Some("videotoolbox"),
+            // FFmpeg checks decoder/device support and falls back to software.
+            // Do not guess the vendor from /dev/dri: it misses NVIDIA, hybrid
+            // GPUs, and containers with a different device configuration.
+            Self::Auto if cfg!(target_os = "linux") => Some("auto"),
             _ => None,
         }
     }
@@ -115,7 +123,7 @@ struct Args {
     /// Skip audio decoding/output entirely
     #[arg(long)]
     no_audio: bool,
-    /// Video decoding: auto uses VideoToolbox for H.264/HEVC on macOS
+    /// Video decoding: auto selects Linux GPU acceleration or macOS VideoToolbox
     #[arg(long, value_enum, default_value = "auto")]
     hwaccel: HardwareMode,
     /// Measure renderer CPU time and terminal output without opening the TUI
@@ -1125,14 +1133,40 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn wait_for_playback(app: &mut App, stage: &str, ready: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready(app) {
+            assert!(
+                !app.ended
+                    && (app.probe.is_some() || app.decoder.is_some())
+                    && Instant::now() < deadline,
+                "{stage}: position={}, ended={}, message={:?}",
+                app.position,
+                app.ended,
+                app.message
+            );
+            app.tick(Instant::now()).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn hardware_auto_is_platform_and_codec_aware_and_can_be_disabled() {
         assert_eq!(HardwareMode::Off.backend(true), None);
-        assert_eq!(HardwareMode::Auto.backend(false), None);
+        assert_eq!(
+            HardwareMode::Auto.backend(false),
+            if cfg!(target_os = "linux") {
+                Some("auto")
+            } else {
+                None
+            }
+        );
         assert_eq!(
             HardwareMode::Auto.backend(true),
             if cfg!(target_os = "macos") {
                 Some("videotoolbox")
+            } else if cfg!(target_os = "linux") {
+                Some("auto")
             } else {
                 None
             }
@@ -1141,6 +1175,8 @@ mod tests {
             HardwareMode::VideoToolbox.backend(false),
             Some("videotoolbox")
         );
+        assert_eq!(HardwareMode::Vaapi.backend(false), Some("vaapi"));
+        assert_eq!(HardwareMode::Cuda.backend(false), Some("cuda"));
         assert_eq!(Args::parse_from(["anscii"]).hwaccel, HardwareMode::Auto);
         assert_eq!(
             Args::parse_from(["anscii", "--hwaccel", "off"]).hwaccel,
@@ -1156,15 +1192,19 @@ mod tests {
             return;
         }
         let video = TestVideo::new();
-        let args = Args::parse_from(["anscii", video.folder.to_str().unwrap()]);
+        // Clock/catch-up behavior must not depend on a hosted runner's GPU
+        // drivers or the time FFmpeg spends trying unavailable accelerators.
+        // Hardware selection and initial-failure fallback have separate tests.
+        let args = Args::parse_from([
+            "anscii",
+            video.folder.to_str().unwrap(),
+            "--hwaccel",
+            "off",
+            "--no-audio",
+        ]);
         let mut app = App::new(args, (100, 30)).unwrap();
         app.play().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while app.image.is_none() && Instant::now() < deadline {
-            app.tick(Instant::now()).unwrap();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(app.image.is_some());
+        wait_for_playback(&mut app, "initial decoded frame", |app| app.image.is_some());
         app.paused = true;
         let paused_position = app.position;
         app.tick(Instant::now() + Duration::from_secs(1)).unwrap();
@@ -1176,11 +1216,7 @@ mod tests {
             )))
             .unwrap();
             assert!(app.image.is_some()); // cached preview survives reconfiguration
-            while app.refreshing && Instant::now() < deadline {
-                app.tick(Instant::now()).unwrap();
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            assert!(!app.refreshing);
+            wait_for_playback(&mut app, "style preview", |app| !app.refreshing);
             assert_eq!(app.position, paused_position);
             assert_eq!(app.image_sampling, app.style.sampling());
             let (sx, sy) = app.image_sampling.factors();
@@ -1191,21 +1227,24 @@ mod tests {
         }
         app.restart(1.0).unwrap();
         assert!(app.paused);
-        while app.image.is_none() && Instant::now() < deadline {
-            app.tick(Instant::now()).unwrap();
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        wait_for_playback(&mut app, "seek preview", |app| app.image.is_some());
         assert_eq!(app.position, 1.0);
         app.paused = false;
         app.clock = Some((Instant::now(), 1.0));
         // Simulate 700 ms of terminal/decode delay. A slow-motion player would
         // advance one frame; this one catches up to 1.7 s by dropping stale frames.
-        while app.position < 1.65 && Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.position < 1.65 && !app.ended && Instant::now() < deadline {
             app.tick(Instant::now() + Duration::from_millis(700))
                 .unwrap();
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(app.position >= 1.65, "did not catch up: {}", app.position);
+        assert!(
+            app.position >= 1.65,
+            "did not catch up: position={}, message={:?}",
+            app.position,
+            app.message
+        );
         assert_eq!(
             app.image.as_ref().unwrap().pixels.len(),
             usize::from(app.image_size.0) * usize::from(app.image_size.1) * 3
