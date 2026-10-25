@@ -23,6 +23,10 @@ jobs:
       - name: macOS dependencies
         if: runner.os == 'macOS'
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+      - name: Media tool versions
+        run: |
+          ffmpeg -version
+          ffprobe -version
       - name: Rust tools
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - run: cargo fmt --check

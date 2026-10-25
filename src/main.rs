@@ -1137,7 +1137,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !ready(app) {
             assert!(
-                !app.ended && Instant::now() < deadline,
+                !app.ended
+                    && (app.probe.is_some() || app.decoder.is_some())
+                    && Instant::now() < deadline,
                 "{stage}: position={}, ended={}, message={:?}",
                 app.position,
                 app.ended,
