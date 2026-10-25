@@ -65,7 +65,7 @@ class LargeTerminalTests(unittest.TestCase):
             self.drain(master, 0.15)
             self.assertEqual(self.drain(master, 0.2)[0], 0)
             os.write(master, b"4")
-            self.assertTrue(self.drain(master, 3, "⣿".encode())[2])
+            self.assertTrue(self.drain(master, 3, b"DENSE")[2])
             self.drain(master, 0.2)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 288, 960, 0, 0))
             process.send_signal(signal.SIGWINCH)

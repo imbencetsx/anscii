@@ -100,9 +100,9 @@ struct Args {
     /// Rendering technique (also selectable live with T or 1-6)
     #[arg(long, value_enum, default_value = "ascii")]
     style: Style,
-    /// Dot/edge/dither cutoff; adjust live with +/-
+    /// Character fill density (128 = normal); adjust live with +/-
     #[arg(long, default_value_t = 128)]
-    threshold: u8,
+    density: u8,
     /// Invert the sampled image (toggle live with I)
     #[arg(long)]
     invert: bool,
@@ -239,7 +239,7 @@ struct App {
     decoder_sampling: Sampling,
     refreshing: bool,
     style: Style,
-    threshold: u8,
+    density: u8,
     invert: bool,
     painter: Painter,
     audio: Option<Audio>,
@@ -289,11 +289,11 @@ impl App {
             resize_at: None,
             image_size: (0, 0),
             decoder_size: (0, 0),
-            image_sampling: Sampling::Braille,
+            image_sampling: Sampling::Cell,
             decoder_sampling: args.style.sampling(),
             refreshing: false,
             style: args.style,
-            threshold: args.threshold,
+            density: args.density,
             invert: args.invert,
             painter: Painter::default(),
             audio: None,
@@ -609,8 +609,8 @@ impl App {
                 KeyCode::Char(digit @ '1'..='6') => {
                     self.style = Style::ALL[digit as usize - '1' as usize]
                 }
-                KeyCode::Char('+' | '=') => self.threshold = self.threshold.saturating_add(8),
-                KeyCode::Char('-' | '_') => self.threshold = self.threshold.saturating_sub(8),
+                KeyCode::Char('+' | '=') => self.density = self.density.saturating_add(8),
+                KeyCode::Char('-' | '_') => self.density = self.density.saturating_sub(8),
                 KeyCode::Char('i' | 'I') => self.invert = !self.invert,
                 KeyCode::Char('r' | 'R') => {
                     let selected = self.files.get(self.selected).cloned();
@@ -692,7 +692,7 @@ impl App {
             return;
         }
         if self.message.is_empty() {
-            grid.text(2, 2, &format!("T styles: 1 ASCII  2 SPACE  3 BLOCKS  4 BRAILLE  5 EDGES  6 DITHER | +/- cutoff {}", self.threshold), MUTED, plain, width - 3);
+            grid.text(2, 2, &format!("T styles: 1 ASCII  2 SPACE  3 BLOCKS  4 DENSE  5 SOLID  6 SHADE | +/- density {}", self.density), MUTED, plain, width - 3);
         } else {
             grid.text(
                 2,
@@ -776,7 +776,7 @@ impl App {
                     style: self.style,
                     mode: self.mode,
                     depth: self.depth,
-                    threshold: self.threshold,
+                    density: self.density,
                     invert: self.invert,
                 },
             );
@@ -1071,7 +1071,7 @@ fn benchmark_techniques(width: u16, height: u16) {
                     style,
                     mode: Mode::Color,
                     depth: Depth::Truecolor,
-                    threshold: 128,
+                    density: 128,
                     invert: false,
                 },
             );
@@ -1231,9 +1231,7 @@ mod tests {
         let args = Args::parse_from(["anscii"]);
         let mut app = App::new(args, (100, 30)).unwrap();
         app.image = Some(Frame {
-            pixels: (0..4)
-                .flat_map(|_| [19, 127, 231, 19, 127, 231, 0, 0, 255, 0, 0, 255])
-                .collect(),
+            pixels: vec![19, 127, 231, 0, 0, 255],
             position: 0.0,
         });
         app.image_size = (2, 1);
