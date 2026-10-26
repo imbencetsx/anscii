@@ -1,7 +1,7 @@
 # ANSCII
 
-A native Rust terminal video player with full RGB ASCII, a folder sidebar, and a
-clickable timeline. Uses FFmpeg for decoding and native audio output for sound.
+A native Rust terminal video player with full RGB ASCII, a popup video picker, and a
+clickable bottom timeline. Uses FFmpeg for decoding and native audio output for sound.
 
 ```sh
 cargo build --release --locked
@@ -53,7 +53,8 @@ For CPU-only machines or slower terminals, `--fps 15` reduces per-second work;
 
 | Input | Action |
 | --- | --- |
-| Up / Down (or K / J) | Select a file |
+| V / click V videos | Open / close the video picker |
+| Up / Down (or K / J) | Select a file in the picker |
 | Enter | Play selected file from the beginning |
 | Space | Pause / resume; replay after finishing |
 | M | Mute / unmute |
@@ -66,11 +67,13 @@ For CPU-only machines or slower terminals, `--fps 15` reduces per-second work;
 | + / - | Increase / decrease character fill density |
 | I | Invert the image |
 | R | Rescan folder |
-| Q / Esc / Ctrl-C | Quit |
+| Esc | Close the picker; quit from the player |
+| Q / Ctrl-C | Quit |
 
 Clicking the timeline after the video finishes resumes playback there. Some
-terminals reserve Shift-click for text selection. Below 65 columns, the sidebar
-hides; keyboard selection still works. Window resizing is supported.
+terminals reserve Shift-click for text selection. The video fills the space above
+the three-row bottom play bar. Press V to switch videos; Enter or a click plays the
+selected file, and Esc closes the picker. Window resizing is supported.
 
 ## Sound
 
@@ -96,7 +99,8 @@ output device; it runs muted so it does not make test noise.
 
 ## Rendering styles
 
-Switch styles while playing or paused. The active style appears in the header.
+Switch styles while playing or paused with T or 1–6. Style and density shortcuts
+work without adding labels or menus to the video view.
 
 - **1 / ASCII**: the classic brightness-to-character ramp.
 - **2 / Whitespace**: the picture is made entirely from spaces with colored
