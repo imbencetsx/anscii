@@ -1185,9 +1185,18 @@ fn main() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_err()
+            .is_ok_and(|status| status.success())
         {
-            eprintln!("anscii: {tool} is required (macOS: brew install ffmpeg)");
+            continue;
+        } else {
+            let hint = if cfg!(target_os = "macos") {
+                "brew install ffmpeg"
+            } else if cfg!(target_os = "linux") {
+                "install your distribution's ffmpeg package (Debian/Ubuntu: sudo apt install ffmpeg)"
+            } else {
+                "install FFmpeg and add ffmpeg/ffprobe to PATH"
+            };
+            eprintln!("anscii: {tool} is unavailable or failed to run; {hint}");
             std::process::exit(1);
         }
     }
