@@ -99,7 +99,7 @@ class LargeTerminalTests(unittest.TestCase):
         original = termios.tcgetattr(slave)
         flags = fcntl.fcntl(slave, fcntl.F_GETFL)
         try:
-            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"LIBRARY")[2])
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"Videos")[2])
             os.write(master, b"\r")
             # Small startup/status screens are not evidence of decoded video.
             self.wait_updates(master, 3, min_bytes=128 * 1024)
@@ -107,7 +107,7 @@ class LargeTerminalTests(unittest.TestCase):
             self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"AUSED")[2])
             self.assert_quiet(master)
             os.write(master, b"4")
-            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"DENSE")[2])
+            self.wait_updates(master, 1)
             self.assert_quiet(master)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 288, 960, 0, 0))
             process.send_signal(signal.SIGWINCH)
@@ -140,7 +140,7 @@ class LargeTerminalTests(unittest.TestCase):
         master, slave, process = self.launch(960, 288, "--no-audio")
         original = termios.tcgetattr(slave)
         try:
-            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"LIBRARY")[2])
+            self.assertTrue(self.drain(master, UPDATE_TIMEOUT, b"Videos")[2])
             os.write(master, b"\r")
             # Deliberately leave the terminal output buffer completely full.
             time.sleep(0.4)

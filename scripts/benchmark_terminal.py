@@ -24,7 +24,7 @@ parser.add_argument("--video", type=Path, default=Path("videos/demo.mp4"))
 parser.add_argument("--size", default="640x192")
 parser.add_argument("--seconds", type=float, default=3)
 parser.add_argument("--mibps", type=float, default=8)
-parser.add_argument("--style", default="ascii", choices=["ascii", "whitespace", "blocks", "braille", "edges", "dither"])
+parser.add_argument("--style", default="ascii", choices=["ascii", "whitespace", "blocks", "dense", "solid", "shade"])
 args = parser.parse_args()
 width, height = map(int, args.size.split("x"))
 rate = args.mibps * 1024 * 1024

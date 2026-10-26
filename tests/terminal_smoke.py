@@ -51,7 +51,7 @@ class TerminalTests(unittest.TestCase):
                 self.assertIn(text, "\n".join(screen.display))
 
             try:
-                wait_for("LIBRARY")
+                wait_for("Videos")
                 os.write(master, b"\r")
                 wait_for("MUTED")
                 wait_for("00:01 / 00:04")
@@ -150,19 +150,30 @@ class TerminalTests(unittest.TestCase):
                         pending.clear()
                 return total
 
+            def video_cells():
+                return [screen.buffer[y][x] for y in range(screen.lines - 3) for x in range(1, screen.columns - 1)]
+
             def style(key, label):
                 os.write(master, key)
-                deadline = time.monotonic() + 3
-                while label not in screen.display[0] and time.monotonic() < deadline:
-                    if select.select([master], [], [], 0.05)[0]:
-                        receive()
-                self.assertIn(label, screen.display[0])
-                drain(0.08)
+                predicates = {
+                    "SPACE": lambda cs: all(c.data == " " for c in cs) and any(c.bg != "default" for c in cs),
+                    "BLOCKS": lambda cs: any(c.data == "▀" for c in cs),
+                    "DENSE": lambda cs: any(c.data in "oOQ0#%@" for c in cs),
+                    "SOLID": lambda cs: all(c.data in " @" for c in cs) and any(c.data == "@" for c in cs),
+                    "SHADE": lambda cs: any(c.data in "░▒▓█" for c in cs),
+                    "ASCII": lambda cs: all(c.bg == "default" and c.data.isascii() for c in cs) and any(c.data != " " for c in cs),
+                }
+                deadline = time.monotonic() + 5
+                while not predicates[label](video_cells()) and time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.05)[0]: receive()
+                self.assertTrue(predicates[label](video_cells()), f"{label} did not render")
+                drain(0.1)
                 self.assertIn("PAUSED", "\n".join(screen.display))
-                return [screen.buffer[y][x] for y in range(4, 27) for x in range(27, 98)]
+                self.assertNotIn("ANSCII /", "\n".join(screen.display))
+                return video_cells()
 
             try:
-                read_until(b"LIBRARY")
+                read_until(b"Videos")
                 os.write(master, b"\r")
                 read_until(b"PLAYING")
                 read_until(b"\x1b[38;2;")
@@ -170,14 +181,20 @@ class TerminalTests(unittest.TestCase):
                 read_until(b"PAUSED")
                 drain(0.1)
                 self.assertEqual(drain(0.25), 0, "paused frames must produce no terminal traffic")
+                os.write(master, b"v")
+                read_until(b"Videos")
+                self.assertIn("clip with spaces.mp4", "\n".join(screen.display))
+                os.write(master, b"\x1b")
+                drain(0.15)
+                self.assertNotIn("Enter play  Esc close", "\n".join(screen.display))
+                self.assertIn("PAUSED", "\n".join(screen.display))
                 cells = style(b"2", "SPACE")
                 self.assertTrue(all(cell.data == " " for cell in cells))
                 self.assertTrue(any(cell.bg != "default" for cell in cells))
                 self.assertTrue(any(cell.data == "▀" for cell in style(b"3", "BLOCKS")))
                 self.assertTrue(any(cell.data in "oOQ0#%@" for cell in style(b"4", "DENSE")))
                 os.write(master, b"+i")
-                read_until(b"INVERTED")
-                drain(0.08)
+                drain(0.15)
                 os.write(master, b"i-")
                 cells = style(b"5", "SOLID")
                 self.assertTrue(any(cell.data == "@" for cell in cells))
@@ -187,8 +204,8 @@ class TerminalTests(unittest.TestCase):
                 self.assertTrue(all(cell.bg == "default" for cell in cells), "background from pixel styles leaked")
                 self.assertEqual(drain(0.15), 0)
                 # SGR mouse reporting is enabled by Crossterm on all platforms.
-                # Timeline runs from x=27 to x=97 (zero-based); midpoint=62.
-                os.write(master, b"\x1b[<0;63;29M\x1b[<0;63;29m")
+                # Timeline runs from x=1 to x=97 (zero-based); midpoint=49.
+                os.write(master, b"\x1b[<0;50;29M\x1b[<0;50;29m")
                 read_until(b"=")
                 read_until(b"\x1b[38;2;")  # sought preview arrives while paused
                 drain(0.1)
@@ -198,7 +215,10 @@ class TerminalTests(unittest.TestCase):
                 os.write(master, b"\x1b[D")
                 read_until(b"-")
                 os.write(master, b"c")
-                read_until(b"WHITE")
+                deadline = time.monotonic() + 5
+                while not any(c.fg == "ffffff" and c.data != " " for c in video_cells()) and time.monotonic() < deadline:
+                    if select.select([master], [], [], 0.05)[0]: receive()
+                self.assertTrue(any(c.fg == "ffffff" and c.data != " " for c in video_cells()))
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 60, 0, 0))
                 screen.resize(lines=20, columns=60)
                 process.send_signal(signal.SIGWINCH)

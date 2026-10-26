@@ -1,7 +1,7 @@
 # ANSCII
 
-A native Rust terminal video player with full RGB ASCII, a folder sidebar, and a
-clickable timeline. Uses FFmpeg for decoding and native audio output for sound.
+A native Rust terminal video player with full RGB ASCII, a popup video picker, and a
+clickable bottom timeline. Uses FFmpeg for decoding and native audio output for sound.
 
 ```sh
 cargo build --release --locked
@@ -11,7 +11,7 @@ cargo build --release --locked
 ./anscii ~/Movies --recursive
 ```
 
-The optimized binary is already built in this checkout. `./anscii` runs it directly.
+`./anscii` runs the optimized native binary after building it on your machine.
 You can also use `cargo run --release -- videos`, or install a command on your PATH:
 
 ```sh
@@ -23,6 +23,52 @@ Requirements: Rust 1.88+ to build, FFmpeg/ffprobe on PATH to play, and an intera
 terminal. On macOS, install FFmpeg with `brew install ffmpeg`. After building, no
 Rust toolchain or Python is needed to run the binary. The old
 `python3 anscii.py videos` command forwards to the same Rust binary.
+
+## Linux setup
+
+The video picker (**V**), bottom play bar, click-to-seek, rendering styles, and
+native audio all use the Linux code path too. Ubuntu 22.04 and 24.04 are covered
+by the existing CI matrix.
+
+Install the build and runtime dependencies, then build with Rust 1.88 or newer:
+
+```sh
+# Debian / Ubuntu
+sudo apt update
+sudo apt install build-essential pkg-config libasound2-dev ffmpeg
+
+# Fedora (use this instead of the apt commands)
+sudo dnf install gcc pkgconf-pkg-config alsa-lib-devel ffmpeg-free
+
+# Arch Linux (use this instead of the apt commands)
+sudo pacman -S --needed base-devel pkgconf alsa-lib ffmpeg
+```
+
+From this repository, with Rust and Cargo on PATH:
+
+```sh
+cargo install --path . --locked
+anscii ~/Videos
+```
+
+ALSA development dependencies are required to build the native audio backend.
+Fedora's `ffmpeg-free` has a restricted codec set; file support depends on the
+installed FFmpeg build. A desktop audio device is used automatically; on a
+headless server use `anscii ~/Videos --no-audio`. Mouse controls require terminal
+mouse reporting; all navigation and seeking also work from the keyboard.
+
+CI also uploads an `anscii-<runner>-<architecture>` artifact containing
+`anscii.tar.gz`. Download a successful build matching your Linux distribution and
+CPU architecture from the repository's Actions tab, unzip the artifact, then:
+
+```sh
+tar -xzf anscii.tar.gz
+./anscii ~/Videos
+```
+
+These builds still need FFmpeg/ffprobe and the ALSA runtime libraries. CI archives
+retain executable permissions and are kept for seven days. Build from source on
+older distributions whose system libraries differ from the runner's.
 
 On macOS, H.264 and HEVC video use **VideoToolbox hardware decoding by default**.
 On Linux, the default asks FFmpeg to select an available accelerator for the video
@@ -53,7 +99,8 @@ For CPU-only machines or slower terminals, `--fps 15` reduces per-second work;
 
 | Input | Action |
 | --- | --- |
-| Up / Down (or K / J) | Select a file |
+| V / click V videos | Open / close the video picker |
+| Up / Down (or K / J) | Select a file in the picker |
 | Enter | Play selected file from the beginning |
 | Space | Pause / resume; replay after finishing |
 | M | Mute / unmute |
@@ -66,11 +113,13 @@ For CPU-only machines or slower terminals, `--fps 15` reduces per-second work;
 | + / - | Increase / decrease character fill density |
 | I | Invert the image |
 | R | Rescan folder |
-| Q / Esc / Ctrl-C | Quit |
+| Esc | Close the picker; quit from the player |
+| Q / Ctrl-C | Quit |
 
 Clicking the timeline after the video finishes resumes playback there. Some
-terminals reserve Shift-click for text selection. Below 65 columns, the sidebar
-hides; keyboard selection still works. Window resizing is supported.
+terminals reserve Shift-click for text selection. The video fills the space above
+the three-row bottom play bar. Press V to switch videos; Enter or a click plays the
+selected file, and Esc closes the picker. Window resizing is supported.
 
 ## Sound
 
@@ -96,7 +145,8 @@ output device; it runs muted so it does not make test noise.
 
 ## Rendering styles
 
-Switch styles while playing or paused. The active style appears in the header.
+Switch styles while playing or paused with T or 1–6. Style and density shortcuts
+work without adding labels or menus to the video view.
 
 - **1 / ASCII**: the classic brightness-to-character ramp.
 - **2 / Whitespace**: the picture is made entirely from spaces with colored

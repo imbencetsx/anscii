@@ -45,13 +45,6 @@ impl Mode {
             Self::Amber => Self::Color,
         }
     }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Color => "COLOR",
-            Self::White => "WHITE",
-            Self::Amber => "AMBER",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -176,23 +169,27 @@ fn discover(folder: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
 struct Layout {
     width: u16,
     height: u16,
-    sidebar: u16,
 }
 
 impl Layout {
     fn new(width: u16, height: u16) -> Self {
-        Self {
-            width,
-            height,
-            sidebar: if width >= 65 {
-                (width / 4).clamp(18, 32)
-            } else {
-                0
-            },
-        }
+        Self { width, height }
     }
     fn left(self) -> u16 {
-        self.sidebar + 2
+        1
+    }
+    fn picker(self, files: usize) -> (u16, u16, u16, u16) {
+        let width = self.width.saturating_sub(4).min(72);
+        let rows = files
+            .max(1)
+            .min(usize::from(self.height.saturating_sub(7).max(1))) as u16;
+        let height = rows + 4;
+        (
+            (self.width.saturating_sub(width)) / 2,
+            self.height.saturating_sub(3 + height) / 2,
+            width,
+            height,
+        )
     }
     fn timeline(self) -> (u16, u16, u16) {
         (
@@ -205,7 +202,7 @@ impl Layout {
         fit(
             ratio,
             self.width.saturating_sub(self.left() + 2).max(1),
-            self.height.saturating_sub(7).max(1),
+            self.height.saturating_sub(3).max(1),
         )
     }
     fn seek_at(self, x: u16, y: u16, duration: f64) -> Option<f64> {
@@ -225,6 +222,7 @@ struct App {
     files: Vec<PathBuf>,
     recursive: bool,
     selected: usize,
+    picker_open: bool,
     path: Option<PathBuf>,
     probe: Option<Probe>,
     metadata: Metadata,
@@ -274,6 +272,7 @@ impl App {
             files,
             recursive: args.recursive,
             selected: 0,
+            picker_open: true,
             path: None,
             probe: None,
             metadata: Metadata {
@@ -318,6 +317,7 @@ impl App {
         let Some(path) = self.files.get(self.selected).cloned() else {
             return Ok(());
         };
+        self.picker_open = false;
         self.probe = None;
         self.audio = None;
         self.audio_failed = false;
@@ -568,16 +568,71 @@ impl App {
     }
 
     fn event(&mut self, event: Event) -> io::Result<bool> {
+        if let Event::Key(key) = &event {
+            if key.kind == KeyEventKind::Release {
+                return Ok(true);
+            }
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(false);
+            }
+            if matches!(key.code, KeyCode::Char('v' | 'V')) {
+                self.picker_open = !self.picker_open;
+                return Ok(true);
+            }
+            if self.picker_open {
+                match key.code {
+                    KeyCode::Esc => self.picker_open = false,
+                    KeyCode::Char('q' | 'Q') => return Ok(false),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.selected = self.selected.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.selected = (self.selected + 1).min(self.files.len().saturating_sub(1))
+                    }
+                    KeyCode::Enter if !self.files.is_empty() => self.play()?,
+                    KeyCode::Char('r' | 'R') => {
+                        self.files = discover(&self.folder, self.recursive)?;
+                        self.selected = self.selected.min(self.files.len().saturating_sub(1));
+                    }
+                    _ => {}
+                }
+                return Ok(true);
+            }
+        }
+        if let Event::Mouse(mouse) = &event
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        {
+            if self.layout.width < 35 || self.layout.height < 10 {
+                return Ok(true);
+            }
+            if self.picker_open {
+                let (x, y, w, h) = self.layout.picker(self.files.len());
+                let count = usize::from(h - 4);
+                let offset = self.selected.saturating_sub(count.saturating_sub(1));
+                if mouse.column > x
+                    && mouse.column < x + w - 1
+                    && mouse.row >= y + 2
+                    && mouse.row < y + h - 2
+                {
+                    let selected = offset + usize::from(mouse.row - y - 2);
+                    if selected < self.files.len() {
+                        self.selected = selected;
+                        self.play()?;
+                    }
+                }
+                return Ok(true);
+            }
+            if mouse.row == self.layout.height.saturating_sub(1) && (1..9).contains(&mouse.column) {
+                self.picker_open = true;
+                return Ok(true);
+            }
+        }
         let old_style = self.style;
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                 KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Ok(false),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(false);
-                }
-                KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected = (self.selected + 1).min(self.files.len().saturating_sub(1))
                 }
                 KeyCode::Enter => self.play()?,
                 KeyCode::Char(' ') if self.path.is_some() => {
@@ -666,32 +721,12 @@ impl App {
     fn draw(&mut self, grid: &mut Grid) {
         grid.clear();
         let layout = self.layout;
-        let (width, height, sidebar) = (layout.width, layout.height, layout.sidebar);
+        let (width, height) = (layout.width, layout.height);
         let plain = Ink::Default;
-        grid.text(
-            2,
-            0,
-            &format!(
-                "ANSCII / {}{}",
-                self.style.label(),
-                if self.invert { " / INVERTED" } else { "" }
-            ),
-            GREEN,
-            plain,
-            width.saturating_sub(3),
-        );
-        grid.text(
-            2,
-            1,
-            &self.folder.to_string_lossy(),
-            MUTED,
-            plain,
-            width.saturating_sub(3),
-        );
         if width < 35 || height < 10 {
             grid.text(
                 1,
-                3,
+                height / 2,
                 "Enlarge terminal (35 x 10 minimum)",
                 MUTED,
                 plain,
@@ -699,81 +734,10 @@ impl App {
             );
             return;
         }
-        if self.message.is_empty() {
-            grid.text(2, 2, &format!("T styles: 1 ASCII  2 SPACE  3 BLOCKS  4 DENSE  5 SOLID  6 SHADE | +/- density {}", self.density), MUTED, plain, width - 3);
-        } else {
-            grid.text(
-                2,
-                2,
-                &self.message,
-                Ink::Rgb([240, 193, 102]),
-                plain,
-                width - 3,
-            );
-        }
-        if sidebar > 0 {
-            grid.text(
-                2,
-                3,
-                &format!("LIBRARY  {:02}", self.files.len()),
-                GREEN,
-                plain,
-                sidebar - 3,
-            );
-            let count = usize::from(height - 7);
-            let offset = self.selected.saturating_sub(count.saturating_sub(1));
-            for (row, (index, path)) in self
-                .files
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .take(count)
-                .enumerate()
-            {
-                let label = path
-                    .strip_prefix(&self.folder)
-                    .unwrap_or(path)
-                    .to_string_lossy();
-                let marker = if Some(path) == self.path.as_ref() {
-                    "> "
-                } else {
-                    "  "
-                };
-                let (fg, bg) = if index == self.selected {
-                    (Ink::Rgb([0, 0, 0]), GREEN)
-                } else {
-                    (plain, plain)
-                };
-                let label = format!("{marker}{label}");
-                for x in 1..sidebar - 1 {
-                    grid.put(x, row as u16 + 4, ' ', fg, bg);
-                }
-                grid.text(1, row as u16 + 4, &label, fg, bg, sidebar - 2);
-            }
-            for y in 3..height - 3 {
-                grid.put(sidebar, y, '|', MUTED, plain);
-            }
-        }
-        let title = self
-            .path
-            .as_ref()
-            .or_else(|| self.probe.as_ref().map(|p| &p.path))
-            .or_else(|| self.files.get(self.selected))
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_else(|| "Your screen is waiting.".into());
-        grid.text(
-            layout.left(),
-            3,
-            &title,
-            plain,
-            plain,
-            width - layout.left() - 1,
-        );
         if let Some(image) = &self.image {
             let (columns, rows) = self.image_size;
             let x0 = layout.left() + width.saturating_sub(layout.left() + columns + 2) / 2;
-            let y0 = 4 + height.saturating_sub(7 + rows) / 2;
+            let y0 = height.saturating_sub(3 + rows) / 2;
             self.painter.sampling = self.image_sampling;
             self.painter.paint(
                 grid,
@@ -788,14 +752,19 @@ impl App {
                     invert: self.invert,
                 },
             );
-        } else if self.path.is_none() && self.probe.is_none() {
+        } else if !self.picker_open {
+            let text = if self.probe.is_some() {
+                "Loading video..."
+            } else {
+                "Press V to choose a video"
+            };
             grid.text(
-                layout.left(),
-                height / 2,
-                "SELECT A VIDEO / PRESS ENTER",
-                GREEN,
+                width.saturating_sub(text.len() as u16) / 2,
+                height.saturating_sub(3) / 2,
+                text,
+                MUTED,
                 plain,
-                width - layout.left() - 1,
+                width - 2,
             );
         }
         let status = if self.probe.is_some() {
@@ -825,30 +794,52 @@ impl App {
         } else {
             format!("AUDIO {}%", self.volume)
         };
-        grid.text(
-            layout.left(),
-            height - 3,
-            &format!(
-                "{status}  {} / {duration}  {} {}  {sound}",
-                timestamp(self.position),
-                self.style.label(),
-                self.mode.label()
-            ),
-            GREEN,
-            plain,
-            width - layout.left() - 1,
+        let title = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|p| p.to_string_lossy())
+            .unwrap_or_default();
+        let info = format!(
+            "{status}  {} / {duration}  {sound}",
+            timestamp(self.position)
         );
+        grid.text(1, height - 3, &info, GREEN, plain, width - 3);
+        let error = !self.message.is_empty()
+            && self.probe.is_none()
+            && self.message != "Choose a video and press Enter"
+            && !self.message.starts_with("No videos found.")
+            && !self.message.starts_with("Finished.");
+        let title = if error {
+            self.message.as_str()
+        } else {
+            title.as_ref()
+        };
+        let title_x = info.len() as u16 + 4;
+        if title_x + 8 < width {
+            grid.text(
+                title_x,
+                height - 3,
+                title,
+                if error {
+                    Ink::Rgb([240, 193, 102])
+                } else {
+                    MUTED
+                },
+                plain,
+                width - title_x - 2,
+            );
+        }
         if self.metadata.duration > 0.0 {
             let (y, x, length) = layout.timeline();
-            let head = ((f64::from(length - 1) * self.position / self.metadata.duration) as u16)
-                .min(length - 1);
+            let head = (f64::from(length - 1) * self.position / self.metadata.duration) as u16;
             for col in 0..length {
                 grid.put(
                     x + col,
                     y,
                     if col < head {
                         '='
-                    } else if col == head {
+                    } else if col == head.min(length - 1) {
                         'o'
                     } else {
                         '-'
@@ -858,7 +849,89 @@ impl App {
                 );
             }
         }
-        grid.text(1, height - 1, "Space pause  M mute  [ ] volume  Enter play  Arrows/click seek  T style  C color  I invert  Q quit", MUTED, plain, width - 2);
+        grid.text(
+            1,
+            height - 1,
+            "V videos   Space pause   Left/Right seek   M mute   Q quit",
+            MUTED,
+            plain,
+            width - 2,
+        );
+        if self.picker_open {
+            self.draw_picker(grid);
+        }
+    }
+
+    fn draw_picker(&self, grid: &mut Grid) {
+        let (x, y, width, height) = self.layout.picker(self.files.len());
+        let background = Ink::Rgb([17, 22, 26]);
+        let text = Ink::Rgb([221, 229, 235]);
+        for row in y..y + height {
+            for col in x..x + width {
+                grid.put(col, row, ' ', text, background);
+            }
+        }
+        for col in x..x + width {
+            grid.put(col, y, '─', MUTED, background);
+            grid.put(col, y + height - 1, '─', MUTED, background);
+        }
+        grid.text(
+            x + 2,
+            y + 1,
+            &format!("Videos  {}", self.files.len()),
+            GREEN,
+            background,
+            width - 4,
+        );
+        let count = usize::from(height - 4);
+        let offset = self.selected.saturating_sub(count.saturating_sub(1));
+        if self.files.is_empty() {
+            grid.text(
+                x + 2,
+                y + 2,
+                "No videos found. R to rescan.",
+                MUTED,
+                background,
+                width - 4,
+            );
+        }
+        for (row, (index, path)) in self
+            .files
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(count)
+            .enumerate()
+        {
+            let (fg, bg) = if index == self.selected {
+                (Ink::Rgb([0, 0, 0]), GREEN)
+            } else {
+                (text, background)
+            };
+            for col in x + 1..x + width - 1 {
+                grid.put(col, y + 2 + row as u16, ' ', fg, bg);
+            }
+            let marker = if self.path.as_ref() == Some(path) {
+                "> "
+            } else {
+                "  "
+            };
+            let label = format!(
+                "{marker}{}",
+                path.strip_prefix(&self.folder)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+            );
+            grid.text(x + 1, y + 2 + row as u16, &label, fg, bg, width - 2);
+        }
+        grid.text(
+            x + 2,
+            y + height - 2,
+            "Up/Down select  Enter play  Esc close",
+            MUTED,
+            background,
+            width - 4,
+        );
     }
 }
 
@@ -1112,9 +1185,18 @@ fn main() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_err()
+            .is_ok_and(|status| status.success())
         {
-            eprintln!("anscii: {tool} is required (macOS: brew install ffmpeg)");
+            continue;
+        } else {
+            let hint = if cfg!(target_os = "macos") {
+                "brew install ffmpeg"
+            } else if cfg!(target_os = "linux") {
+                "install your distribution's ffmpeg package (Debian/Ubuntu: sudo apt install ffmpeg)"
+            } else {
+                "install FFmpeg and add ffmpeg/ffprobe to PATH"
+            };
+            eprintln!("anscii: {tool} is unavailable or failed to run; {hint}");
             std::process::exit(1);
         }
     }
@@ -1266,6 +1348,78 @@ mod tests {
     }
 
     #[test]
+    fn picker_fits_above_the_bottom_controls() {
+        for (width, height) in [(35, 10), (60, 20), (100, 30)] {
+            let layout = Layout::new(width, height);
+            for files in [0, 1, 20, 1000] {
+                let (x, y, w, h) = layout.picker(files);
+                assert!(w > 4 && h >= 5);
+                assert!(x + w < width);
+                assert!(y + h <= height - 3);
+            }
+            assert_eq!(layout.timeline().0, height - 2);
+            assert_eq!(layout.left(), 1);
+        }
+    }
+
+    #[test]
+    fn video_picker_selects_plays_and_closes_without_stopping_the_video() {
+        use crate::test_support::TestVideo;
+        if !TestVideo::available() {
+            return;
+        }
+        let video = TestVideo::new();
+        let second = video.folder.join("second.mp4");
+        fs::copy(&video.path, &second).unwrap();
+        let second = fs::canonicalize(second).unwrap();
+        let args = Args::parse_from([
+            "anscii",
+            video.folder.to_str().unwrap(),
+            "--no-audio",
+            "--hwaccel",
+            "off",
+        ]);
+        let mut app = App::new(args, (100, 30)).unwrap();
+        fn key(app: &mut App, code: KeyCode) {
+            assert!(
+                app.event(Event::Key(crossterm::event::KeyEvent::new(
+                    code,
+                    KeyModifiers::NONE
+                )))
+                .unwrap()
+            );
+        }
+        assert!(app.picker_open);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.picker_open);
+        assert_eq!(app.probe.as_ref().unwrap().path, second);
+        wait_for_playback(&mut app, "selected video", |app| app.image.is_some());
+        app.paused = true;
+        let position = app.position;
+        key(&mut app, KeyCode::Char('v'));
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.picker_open);
+        assert_eq!(app.path.as_ref(), Some(&second));
+        assert_eq!(app.position, position);
+        assert!(app.paused);
+        app.event(Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 29,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+        assert!(app.picker_open);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.probe.as_ref().unwrap().path,
+            fs::canonicalize(&video.path).unwrap()
+        );
+    }
+
+    #[test]
     fn exact_color_survives_frame_composition() {
         let args = Args::parse_from(["anscii"]);
         let mut app = App::new(args, (100, 30)).unwrap();
@@ -1274,6 +1428,7 @@ mod tests {
             position: 0.0,
         });
         app.image_size = (2, 1);
+        app.picker_open = false;
         let mut grid = Grid::new(100, 30);
         app.draw(&mut grid);
         assert!(
